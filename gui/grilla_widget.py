@@ -9,6 +9,10 @@ from gui.image_saver import ImageSaverThread
 import numpy as np
 from datetime import datetime
 import uuid
+import json
+import os
+
+CONFIG_FILE_PATH = "config.json"
 
 class GrillaWidget(QWidget):
     log_signal = pyqtSignal(str)
@@ -69,6 +73,33 @@ class GrillaWidget(QWidget):
             cam_data["rtsp"] = generar_rtsp(cam_data)
 
         self.cam_data = cam_data
+        self.discarded_cells = set() # Limpiar antes de cargar
+
+        current_cam_ip = self.cam_data.get("ip")
+        if current_cam_ip:
+            try:
+                with open(CONFIG_FILE_PATH, 'r') as f: # CONFIG_FILE_PATH will be defined at module level
+                    config_data = json.load(f)
+
+                camaras_config = config_data.get("camaras", [])
+                for cam_config in camaras_config:
+                    if cam_config.get("ip") == current_cam_ip:
+                        discarded_list = cam_config.get("discarded_grid_cells")
+                        if isinstance(discarded_list, list):
+                            for cell_coords in discarded_list:
+                                if isinstance(cell_coords, list) and len(cell_coords) == 2:
+                                    self.discarded_cells.add(tuple(cell_coords))
+                            self.registrar_log(f"Cargadas {len(self.discarded_cells)} celdas descartadas para {current_cam_ip}")
+                        break
+            except FileNotFoundError:
+                self.registrar_log(f"Archivo de configuración '{CONFIG_FILE_PATH}' no encontrado. Iniciando sin celdas descartadas predefinidas.")
+            except json.JSONDecodeError:
+                self.registrar_log(f"Error al decodificar '{CONFIG_FILE_PATH}'. Verifique el formato del archivo.")
+            except Exception as e: # Captura genérica para otros posibles errores
+                self.registrar_log(f"Error inesperado al cargar config: {e}")
+        else:
+            self.registrar_log("No se pudo obtener la IP de la cámara para cargar celdas descartadas.")
+
         self.alertas = GestorAlertas(cam_id=str(uuid.uuid4())[:8], filas=self.filas, columnas=self.columnas)
 
         self.visualizador = VisualizadorDetector(cam_data)
@@ -256,6 +287,8 @@ class GrillaWidget(QWidget):
             return
 
         self.discarded_cells.update(self.selected_cells)
+        # Guardar la configuración
+        self._save_discarded_cells_to_config()
         self.selected_cells.clear()
         self.request_paint_update() # Request repaint to reflect changes
 
@@ -276,8 +309,59 @@ class GrillaWidget(QWidget):
             self.discarded_cells.remove(cell)
 
         self.log_signal.emit(f"Celdas habilitadas para analíticas: {len(cells_to_enable)}") # Opcional: registrar log
+        # Guardar la configuración
+        self._save_discarded_cells_to_config()
         self.selected_cells.clear()
         self.request_paint_update()
+
+    def _save_discarded_cells_to_config(self):
+        if not self.cam_data or not self.cam_data.get("ip"):
+            self.registrar_log("Error: No se pudo obtener la IP de la cámara para guardar la configuración de celdas descartadas.")
+            return
+
+        current_cam_ip = self.cam_data.get("ip")
+        # Convertir set de tuplas a lista de listas para JSON
+        discarded_list_for_json = sorted([list(cell) for cell in self.discarded_cells]) # Ordenar para consistencia
+
+        config_data = None
+        try:
+            with open(CONFIG_FILE_PATH, 'r') as f:
+                config_data = json.load(f)
+        except FileNotFoundError:
+            self.registrar_log(f"Archivo '{CONFIG_FILE_PATH}' no encontrado. Se intentará crear uno nuevo o se asumirá una lista de cámaras vacía si no se puede cargar.")
+            config_data = {"camaras": [], "configuracion": {}} # Estructura base
+        except json.JSONDecodeError:
+            self.registrar_log(f"Error crítico: El archivo de configuración '{CONFIG_FILE_PATH}' está corrupto. No se guardarán los cambios para evitar mayor pérdida de datos.")
+            return # No continuar si el JSON está corrupto
+        except Exception as e:
+            self.registrar_log(f"Error inesperado al leer '{CONFIG_FILE_PATH}': {e}")
+            return
+
+
+        camara_encontrada = False
+        if "camaras" not in config_data: # Asegurar que la clave "camaras" exista
+            config_data["camaras"] = []
+
+        for cam_config in config_data["camaras"]:
+            if cam_config.get("ip") == current_cam_ip:
+                cam_config["discarded_grid_cells"] = discarded_list_for_json
+                camara_encontrada = True
+                break
+
+        if not camara_encontrada:
+            new_cam_entry = self.cam_data.copy()
+            new_cam_entry["discarded_grid_cells"] = discarded_list_for_json
+            config_data["camaras"].append(new_cam_entry)
+            self.registrar_log(f"Cámara {current_cam_ip} no encontrada en config.json. Se añadió una nueva entrada.")
+
+
+        try:
+            with open(CONFIG_FILE_PATH, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            self.registrar_log(f"Configuración de celdas descartadas guardada para la cámara {current_cam_ip} en '{CONFIG_FILE_PATH}'.")
+        except Exception as e:
+            self.registrar_log(f"Error al escribir la configuración en '{CONFIG_FILE_PATH}': {e}")
+
 
 
     def paintEvent(self, event):
