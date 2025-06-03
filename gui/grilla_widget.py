@@ -243,6 +243,11 @@ class GrillaWidget(QWidget):
                 menu = QMenu(self)
                 discard_action = menu.addAction("Descartar celdas para analíticas")
                 discard_action.triggered.connect(self.handle_discard_cells)
+
+                # Nueva acción para habilitar celdas
+                enable_action = menu.addAction("Habilitar celdas para analíticas")
+                enable_action.triggered.connect(self.handle_enable_discarded_cells)
+
                 menu.exec(event.globalPosition().toPoint())
 
 
@@ -253,6 +258,27 @@ class GrillaWidget(QWidget):
         self.discarded_cells.update(self.selected_cells)
         self.selected_cells.clear()
         self.request_paint_update() # Request repaint to reflect changes
+
+    def handle_enable_discarded_cells(self):
+        if not self.selected_cells:
+            return
+
+        cells_to_enable = self.selected_cells.intersection(self.discarded_cells)
+        if not cells_to_enable:
+            # Si ninguna de las celdas seleccionadas está actualmente descartada,
+            # podríamos opcionalmente limpiar la selección o no hacer nada.
+            # Por ahora, limpiamos la selección para consistencia con handle_discard_cells.
+            self.selected_cells.clear()
+            self.request_paint_update()
+            return
+
+        for cell in cells_to_enable:
+            self.discarded_cells.remove(cell)
+
+        self.log_signal.emit(f"Celdas habilitadas para analíticas: {len(cells_to_enable)}") # Opcional: registrar log
+        self.selected_cells.clear()
+        self.request_paint_update()
+
 
     def paintEvent(self, event):
         super().paintEvent(event) 
