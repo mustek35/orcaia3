@@ -1,9 +1,10 @@
-from PyQt6.QtWidgets import QWidget, QSizePolicy
+from PyQt6.QtWidgets import QWidget, QSizePolicy, QMenu
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QBrush, QFont, QImage
 from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QSizeF, QSize, QPointF, QTimer 
 from gui.visualizador_detector import VisualizadorDetector
 from core.gestor_alertas import GestorAlertas
 from core.rtsp_builder import generar_rtsp
+from core.analytics_processor import AnalyticsProcessor
 from gui.image_saver import ImageSaverThread 
 import numpy as np
 from datetime import datetime
@@ -22,12 +23,18 @@ class GrillaWidget(QWidget):
         self.last_frame = None 
         self.original_frame_size = None 
         self.latest_tracked_boxes = [] 
+        self.selected_cells = set()
+        self.discarded_cells = set()
 
         self.cam_data = None
         self.alertas = None
         self.objetos_previos = {}
         self.umbral_movimiento = 20
         self.detector = None 
+        self.analytics_processor = AnalyticsProcessor(self) # Pass self as parent for Qt object management
+        # You might want to connect its signals if you were using it actively
+        # self.analytics_processor.log_signal.connect(self.registrar_log) 
+        # self.analytics_processor.processing_finished.connect(self.handle_analytics_results)
 
         self.setFixedSize(640, 480) 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -106,11 +113,51 @@ class GrillaWidget(QWidget):
                 self.registrar_log(f"🟢 Movimiento {log_msg_detail} (ID: {tracker_id}) - {clase_nombre} ({conf:.2f}) en ({cx}, {cy})")
             self.objetos_previos[cls] = current_cls_positions[-10:]
 
-        if self.alertas and self.last_frame is not None: 
+        if self.alertas and self.last_frame is not None:
+            detecciones_filtradas = []
+            if self.original_frame_size and self.original_frame_size.width() > 0 and self.original_frame_size.height() > 0:
+                cell_w_video = self.original_frame_size.width() / self.columnas
+                cell_h_video = self.original_frame_size.height() / self.filas
+
+                if cell_w_video > 0 and cell_h_video > 0: # Avoid division by zero
+                    for detection_data in nuevas_detecciones_para_alertas: # Assuming items are (x1, y1, x2, y2, cls)
+                        x1_orig, y1_orig, x2_orig, y2_orig, cls_orig = detection_data
+                        
+                        # Calculate center of the detection in original video coordinates
+                        cx_orig = (x1_orig + x2_orig) / 2
+                        cy_orig = (y1_orig + y2_orig) / 2
+
+                        # Determine the cell this detection falls into
+                        # Ensure cx_orig and cy_orig are within bounds before division
+                        if not (0 <= cx_orig < self.original_frame_size.width() and \
+                                0 <= cy_orig < self.original_frame_size.height()):
+                            detecciones_filtradas.append(detection_data) # Keep if center is out of bounds
+                            continue
+
+                        col_video = int(cx_orig / cell_w_video)
+                        row_video = int(cy_orig / cell_h_video)
+                        
+                        # Clamp col_video and row_video to be within grid bounds
+                        col_video = max(0, min(col_video, self.columnas - 1))
+                        row_video = max(0, min(row_video, self.filas - 1))
+
+                        if (row_video, col_video) not in self.discarded_cells:
+                            detecciones_filtradas.append(detection_data)
+                        else:
+                            # Optional: Log that a detection was ignored
+                            # self.registrar_log(f"ℹ️ Detección en ({x1_orig:.0f},{y1_orig:.0f})-({x2_orig:.0f},{y2_orig:.0f}) ignorada en celda descartada ({row_video}, {col_video})")
+                            pass 
+                else: 
+                    # Fallback if cell dimensions are zero (should not happen if width/height > 0)
+                    detecciones_filtradas = list(nuevas_detecciones_para_alertas) 
+            else: 
+                # Fallback if original_frame_size is not available
+                detecciones_filtradas = list(nuevas_detecciones_para_alertas)
+
             self.alertas.procesar_detecciones(
-                nuevas_detecciones_para_alertas, 
-                self.last_frame, 
-                self.registrar_log, 
+                detecciones_filtradas, 
+                self.last_frame,
+                self.registrar_log,
                 self.cam_data
             )
             self.temporal = self.alertas.temporal
@@ -135,13 +182,10 @@ class GrillaWidget(QWidget):
                    self.original_frame_size.height() != current_frame_height:
                     self.original_frame_size = QSize(current_frame_width, current_frame_height) 
                 
-                buffer = img_converted.constBits()
-                if buffer is None: # Verificación adicional del buffer
-                    return
+                ptr = img_converted.constBits()
+                ptr.setsize(img_converted.width() * img_converted.height() * 3)
 
-                # Copiar el buffer para self.last_frame
-                # Es importante que este array sea independiente del buffer de QImage
-                arr = np.frombuffer(buffer, dtype=np.uint8).reshape(
+                arr = np.frombuffer(ptr, dtype=np.uint8).reshape(
                     (img_converted.height(), img_converted.width(), 3)
                 ).copy()
                 self.last_frame = arr 
@@ -160,11 +204,55 @@ class GrillaWidget(QWidget):
     def detener(self):
         if hasattr(self, 'visualizador') and self.visualizador: 
             self.visualizador.detener()
+            # self.visualizador = None # Keep this for later, stop processor first
+        
+        if hasattr(self, 'analytics_processor') and self.analytics_processor:
+            self.analytics_processor.stop_processing()
+            # self.analytics_processor = None # Optionally, also set to None
+            
+        if hasattr(self, 'visualizador') and self.visualizador: # Re-check as visualizador might be used by processor
             self.visualizador = None 
         if self.detector: 
              self.detector = None
         self.paint_update_timer.stop() 
 
+    def mousePressEvent(self, event):
+        pos = event.pos()
+        cell_w = self.width() / self.columnas
+        cell_h = self.height() / self.filas
+
+        if cell_w == 0 or cell_h == 0: # Avoid division by zero if widget not fully initialized
+            return
+
+        col = int(pos.x() / cell_w)
+        row = int(pos.y() / cell_h)
+
+        if not (0 <= row < self.filas and 0 <= col < self.columnas): # Click is outside grid
+            return
+
+        clicked_cell = (row, col)
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            if clicked_cell in self.selected_cells:
+                self.selected_cells.remove(clicked_cell)
+            else:
+                self.selected_cells.add(clicked_cell)
+            self.request_paint_update() # Request repaint to show selection
+        elif event.button() == Qt.MouseButton.RightButton:
+            if self.selected_cells: # Only show menu if there are selected cells
+                menu = QMenu(self)
+                discard_action = menu.addAction("Descartar celdas para analíticas")
+                discard_action.triggered.connect(self.handle_discard_cells)
+                menu.exec(event.globalPosition().toPoint())
+
+
+    def handle_discard_cells(self):
+        if not self.selected_cells: # Guard clause, though menu shouldn't appear if empty
+            return
+
+        self.discarded_cells.update(self.selected_cells)
+        self.selected_cells.clear()
+        self.request_paint_update() # Request repaint to reflect changes
 
     def paintEvent(self, event):
         super().paintEvent(event) 
@@ -191,11 +279,23 @@ class GrillaWidget(QWidget):
                 index = row * self.columnas + col
                 estado_area = self.area[index] if index < len(self.area) else 0
                 rect_to_draw = QRectF(col * cell_w, row * cell_h, cell_w, cell_h)
-                current_brush = Qt.BrushStyle.NoBrush
-                if index in self.temporal: 
-                    current_brush = QBrush(QColor(0, 255, 0, 100)) 
+                current_brush = Qt.BrushStyle.NoBrush # Default to no brush
+
+                cell_tuple = (row, col) # Create tuple for checking in sets
+
+                if cell_tuple in self.discarded_cells:
+                    current_brush = QBrush(QColor(200, 0, 0, 150)) # Darker, more opaque red for discarded
+                elif cell_tuple in self.selected_cells:
+                    current_brush = QBrush(QColor(255, 0, 0, 100)) # Transparent red for selected
+                elif index in self.temporal: 
+                    current_brush = QBrush(QColor(0, 255, 0, 100)) # Existing temporal color
                 elif estado_area == 1: 
-                    current_brush = QBrush(QColor(255, 0, 0, 100)) 
+                    # This was QColor(255, 0, 0, 100), same as selected_cells.
+                    # Let's keep it for now, but it might need differentiation if estado_area == 1
+                    # should look different from selected_cells.
+                    # For now, selected_cells will take precedence if a cell is both area=1 and selected.
+                    current_brush = QBrush(QColor(255, 165, 0, 100)) # Orange for area=1 to differentiate for now
+                
                 qp.setBrush(current_brush)
                 qp.setPen(QColor(100, 100, 100, 100)) 
                 qp.drawRect(rect_to_draw)
