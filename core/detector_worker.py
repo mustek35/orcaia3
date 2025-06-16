@@ -4,7 +4,7 @@ from ultralytics import YOLO
 import numpy as np
 from core.advanced_tracker import AdvancedTracker
 from gui.image_saver import ImageSaverThread
-import os  # <--- IMPORT OS AÑADIDO
+import os
 from pathlib import Path
 
 logger = get_logger(__name__)
@@ -18,7 +18,7 @@ _BASE_MODEL_PATH = Path(__file__).resolve().parent / "models"
 MODEL_PATHS = {
     "Embarcaciones": _BASE_MODEL_PATH / "best.pt",
     "Personas": _BASE_MODEL_PATH / "yolov8m.pt",
-    "Autos": _BASE_MODEL_PATH / "yolov8m.pt",
+    "Autos": _BASE_MODEL_PATH / "yolov8m.pt", 
     "Barcos": _BASE_MODEL_PATH / "yolov8m.pt",
 }
 
@@ -46,9 +46,7 @@ def iou(boxA, boxB):
     return iou_val
 
 class DetectorWorker(QThread):
-
     result_ready = pyqtSignal(list, str, int)
-
 
     def __init__(self, model_key="Personas", parent=None, frame_interval=1, confidence=0.5, imgsz=640, device=None, track=True, lost_ttl=5):
         super().__init__(parent)
@@ -61,8 +59,14 @@ class DetectorWorker(QThread):
 
         logger.info(f"{self.objectName()}: Usando {'GPU' if self.device.startswith('cuda') else 'CPU'} para el modelo '{self.model_key}'")
 
-        default_model_path = _BASE_MODEL_PATH / "yolov8n.pt"
+        # Usar modelo por defecto si no existe el archivo específico
+        default_model_path = "yolov8n.pt"  # Modelo que se descarga automáticamente
         model_path = MODEL_PATHS.get(model_key, default_model_path)
+        
+        # Si el archivo local no existe, usar el modelo por defecto
+        if not os.path.exists(model_path):
+            logger.warning(f"{self.objectName()}: Archivo del modelo {model_path} no encontrado, usando {default_model_path}")
+            model_path = default_model_path
 
         model_classes_for_key = MODEL_CLASSES.get(model_key)
         if model_classes_for_key is None:
@@ -72,10 +76,11 @@ class DetectorWorker(QThread):
             self.model_classes = model_classes_for_key
 
         model_path_str = str(model_path)
-        logger.info("YOLO: solicitando modelo '%s' (real %s) desde %s para %s", self.model_key, os.path.basename(model_path_str), model_path_str, self.objectName())
+        logger.info("YOLO: solicitando modelo '%s' desde %s para %s", self.model_key, model_path_str, self.objectName())
+        
         if model_path_str in yolo_model_cache:
             self.model = yolo_model_cache[model_path_str]
-            logger.info("YOLO Cache: usando modelo '%s' (Path: %s) desde caché para %s", self.model_key, model_path_str, self.objectName())
+            logger.info("YOLO Cache: usando modelo '%s' desde caché para %s", self.model_key, self.objectName())
         else:
             try:
                 self.model = YOLO(model_path_str)
@@ -84,7 +89,7 @@ class DetectorWorker(QThread):
                 except Exception:
                     logger.warning("%s: model.to(%s) failed; relying on predict device parameter", self.objectName(), self.device)
                 yolo_model_cache[model_path_str] = self.model
-                logger.info("YOLO Cache: modelo '%s' (Path: %s) cargado y añadido a caché para %s", self.model_key, model_path_str, self.objectName())
+                logger.info("YOLO Cache: modelo '%s' cargado y añadido a caché para %s", self.model_key, self.objectName())
             except Exception as e:
                 logger.error("Failed to load model %s for %s: %s", model_path_str, self.objectName(), e)
                 raise e
@@ -106,10 +111,9 @@ class DetectorWorker(QThread):
         )
 
         self.frame = None
-
         self.frame_id = None
-
         self.running = False
+        
         if self.track:
             self.tracker = AdvancedTracker(
                 conf_threshold=self.confidence,
@@ -118,6 +122,7 @@ class DetectorWorker(QThread):
             )
         else:
             self.tracker = None
+        
         self.recently_captured_track_ids = set()
         self.active_savers = []
 
@@ -138,6 +143,8 @@ class DetectorWorker(QThread):
             logger.error("%s: Modelo no cargado. Deteniendo hilo", self.objectName())
             return
 
+        logger.info("%s: Iniciando bucle de detección", self.objectName())
+        
         while self.running:
             if self.frame is not None:
                 logger.debug("%s: Processing new frame", self.objectName())
@@ -146,66 +153,156 @@ class DetectorWorker(QThread):
                 frame_h, frame_w = current_frame_to_process.shape[:2]
                 self.frame = None
                 self.frame_id = None
+                
+                logger.info(f"%s: Frame dimensions: {frame_w}x{frame_h}", self.objectName())
+                
                 try:
-                    logger.debug("%s: Calling model.predict classes=%s conf=%s imgsz=%s", self.objectName(), self.model_classes, self.confidence, self.imgsz)
-                    yolo_results = self.model.predict(source=current_frame_to_process, classes=self.model_classes, conf=self.confidence, imgsz=self.imgsz, verbose=False, device=self.device)[0]
-                    logger.debug("%s: model.predict successful. Raw boxes count %s", self.objectName(), len(yolo_results.boxes) if yolo_results else 'N/A')
+                    logger.debug("%s: Calling model.predict classes=%s conf=%s imgsz=%s", 
+                               self.objectName(), self.model_classes, self.confidence, self.imgsz)
+                    
+                    # Realizar predicción con YOLO
+                    yolo_results = self.model.predict(
+                        source=current_frame_to_process, 
+                        classes=self.model_classes, 
+                        conf=self.confidence, 
+                        imgsz=self.imgsz, 
+                        verbose=False, 
+                        device=self.device,
+                        save=False,
+                        show=False
+                    )[0]
+                    
+                    logger.info("%s: model.predict successful. Raw boxes count %s", 
+                               self.objectName(), len(yolo_results.boxes) if yolo_results.boxes is not None else 0)
+                    
                 except Exception as e:
                     logger.error("%s: error durante model.predict: %s", self.objectName(), e)
                     self.msleep(100)
                     continue
 
                 current_detections = []
-                for r in yolo_results.boxes:
-                    x1, y1, x2, y2 = map(int, r.xyxy[0].tolist())
-                    x1 = max(0, min(x1, frame_w - 1))
-                    y1 = max(0, min(y1, frame_h - 1))
-                    x2 = max(0, min(x2, frame_w - 1))
-                    y2 = max(0, min(y2, frame_h - 1))
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    cls = int(r.cls[0])
-                    conf = float(r.conf[0])
-                    remap_dict = CLASS_REMAP.get(self.model_key)
-                    if remap_dict:
-                        cls = remap_dict.get(cls, cls)
-                    current_detections.append({'bbox': [x1, y1, x2, y2], 'cls': cls, 'conf': conf})
-
-                if self.track:
-                    tracks = self.tracker.update(current_detections, frame=current_frame_to_process)
-
-                    output_for_signal = []
-                    for trk in tracks:
-                        x1, y1, x2, y2 = map(int, trk['bbox'])
-                        x1 = max(0, min(x1, frame_w - 1))
-                        y1 = max(0, min(y1, frame_h - 1))
-                        x2 = max(0, min(x2, frame_w - 1))
-                        y2 = max(0, min(y2, frame_h - 1))
-                        if x2 <= x1 or y2 <= y1:
+                
+                # Procesar resultados de YOLO
+                if yolo_results.boxes is not None and len(yolo_results.boxes) > 0:
+                    for i, r in enumerate(yolo_results.boxes):
+                        try:
+                            # Obtener coordenadas originales
+                            xyxy = r.xyxy[0].tolist()
+                            x1_orig, y1_orig, x2_orig, y2_orig = xyxy
+                            
+                            # Aplicar límites del frame
+                            x1 = int(max(0, min(x1_orig, frame_w - 1)))
+                            y1 = int(max(0, min(y1_orig, frame_h - 1)))
+                            x2 = int(max(0, min(x2_orig, frame_w - 1)))
+                            y2 = int(max(0, min(y2_orig, frame_h - 1)))
+                            
+                            # Verificar que el box sea válido
+                            if x2 <= x1 or y2 <= y1:
+                                logger.warning(f"%s: Box inválido ignorado: original=({x1_orig:.1f},{y1_orig:.1f},{x2_orig:.1f},{y2_orig:.1f}) -> clamped=({x1},{y1},{x2},{y2})", self.objectName())
+                                continue
+                                
+                            cls = int(r.cls[0])
+                            conf = float(r.conf[0])
+                            
+                            # Debug: Imprimir coordenadas originales vs procesadas
+                            logger.info(f"%s: Detection {i}: original=({x1_orig:.1f},{y1_orig:.1f},{x2_orig:.1f},{y2_orig:.1f}) -> final=({x1},{y1},{x2},{y2}) cls={cls} conf={conf:.3f}", 
+                                       self.objectName())
+                            
+                            # Aplicar remapeo de clases si existe
+                            remap_dict = CLASS_REMAP.get(self.model_key)
+                            if remap_dict:
+                                original_cls = cls
+                                cls = remap_dict.get(cls, cls)
+                                if original_cls != cls:
+                                    logger.info(f"%s: Class remapped: {original_cls} -> {cls}", self.objectName())
+                            
+                            current_detections.append({
+                                'bbox': [x1, y1, x2, y2], 
+                                'cls': cls, 
+                                'conf': conf
+                            })
+                            
+                        except Exception as e:
+                            logger.error("%s: Error procesando detección individual %d: %s", self.objectName(), i, e)
                             continue
-                        output_for_signal.append({
-                            'bbox': (x1, y1, x2, y2),
-                            'id': trk['id'],
-                            'cls': trk['cls'],
-                            'conf': trk['conf'],
-                            'centers': trk['centers'],
-                            'moving': trk.get('moving'),
-                        })
+
+                logger.info("%s: Procesadas %d detecciones válidas de %d totales", 
+                           self.objectName(), len(current_detections), 
+                           len(yolo_results.boxes) if yolo_results.boxes is not None else 0)
+
+                # Aplicar tracking si está habilitado
+                if self.track and current_detections:
+                    try:
+                        tracks = self.tracker.update(current_detections, frame=current_frame_to_process)
+                        logger.info("%s: Tracker devolvió %d tracks de %d detecciones", 
+                                   self.objectName(), len(tracks), len(current_detections))
+                        
+                        output_for_signal = []
+                        for j, trk in enumerate(tracks):
+                            bbox = trk['bbox']
+                            x1, y1, x2, y2 = map(int, bbox)
+                            
+                            # Verificar límites otra vez por seguridad
+                            x1 = max(0, min(x1, frame_w - 1))
+                            y1 = max(0, min(y1, frame_h - 1))
+                            x2 = max(0, min(x2, frame_w - 1))
+                            y2 = max(0, min(y2, frame_h - 1))
+                            
+                            if x2 <= x1 or y2 <= y1:
+                                logger.warning(f"%s: Track {j} bbox inválido después de tracking: ({x1},{y1},{x2},{y2})", self.objectName())
+                                continue
+                            
+                            track_data = {
+                                'bbox': (x1, y1, x2, y2),
+                                'id': trk['id'],
+                                'cls': trk['cls'],
+                                'conf': trk['conf'],
+                                'centers': trk['centers'],
+                                'moving': trk.get('moving'),
+                            }
+                            
+                            output_for_signal.append(track_data)
+                            
+                            logger.info(f"%s: Track {j}: ID={trk['id']} bbox=({x1},{y1},{x2},{y2}) cls={trk['cls']} conf={trk['conf']:.3f}", 
+                                       self.objectName())
+                            
+                    except Exception as e:
+                        logger.error("%s: Error en tracker: %s", self.objectName(), e)
+                        # Fallback: usar detecciones sin tracking
+                        output_for_signal = [
+                            {
+                                'bbox': (int(d['bbox'][0]), int(d['bbox'][1]), int(d['bbox'][2]), int(d['bbox'][3])),
+                                'cls': d['cls'],
+                                'conf': d['conf'],
+                                'id': i,  # ID temporal
+                            }
+                            for i, d in enumerate(current_detections)
+                        ]
+                        logger.info(f"%s: Fallback - usando {len(output_for_signal)} detecciones sin tracking", self.objectName())
                 else:
-                    # Emit raw detections without tracking
+                    # Sin tracking: emitir detecciones directamente
                     output_for_signal = [
                         {
-                            'bbox': (int(b[0]), int(b[1]), int(b[2]), int(b[3])),
+                            'bbox': (int(d['bbox'][0]), int(d['bbox'][1]), int(d['bbox'][2]), int(d['bbox'][3])),
                             'cls': d['cls'],
                             'conf': d['conf'],
+                            'id': i,  # ID temporal
                         }
-                        for d in current_detections
-                        for b in [d['bbox']]
+                        for i, d in enumerate(current_detections)
                     ]
+                    logger.info(f"%s: Sin tracking - emitiendo {len(output_for_signal)} detecciones directas", self.objectName())
 
-
+                logger.info("%s: Emitiendo %d detecciones finales para frame %d", 
+                           self.objectName(), len(output_for_signal), current_frame_id)
+                
+                # Debug final: Imprimir todas las detecciones que se van a emitir
+                for k, det in enumerate(output_for_signal):
+                    bbox = det['bbox']
+                    logger.info(f"%s: FINAL Detection {k}: ID={det['id']} bbox={bbox} cls={det['cls']} conf={det['conf']:.3f}", 
+                               self.objectName())
+                
+                # Emitir resultados
                 self.result_ready.emit(output_for_signal, self.model_key, current_frame_id)
-
 
             self.msleep(10)
 
