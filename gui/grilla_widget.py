@@ -16,14 +16,14 @@ import uuid
 import json
 import os
 
-DEBUG_LOGS = False
+DEBUG_LOGS = False  # Deshabilitado para producción
 
 CONFIG_FILE_PATH = "config.json"
 
 class GrillaWidget(QWidget):
     log_signal = pyqtSignal(str)
 
-    def __init__(self, filas=18, columnas=22, area=None, parent=None):
+    def __init__(self, filas=18, columnas=22, area=None, parent=None, fps_config=None):
         super().__init__(parent)
         self.filas = filas
         self.columnas = columnas
@@ -41,10 +41,21 @@ class GrillaWidget(QWidget):
         self.objetos_previos = {}
         self.umbral_movimiento = 20
         self.detectors = None 
-        self.analytics_processor = AnalyticsProcessor(self) # Pass self as parent for Qt object management
-        # You might want to connect its signals if you were using it actively
-        # self.analytics_processor.log_signal.connect(self.registrar_log)
-        # self.analytics_processor.processing_finished.connect(self.handle_analytics_results)
+        self.analytics_processor = AnalyticsProcessor(self)
+
+        # Configuración de FPS personalizable
+        if fps_config is None:
+            fps_config = {
+                "visual_fps": 25,
+                "detection_fps": 8,
+                "ui_update_fps": 15
+            }
+        
+        self.fps_config = fps_config
+        
+        # Calcular intervalos basados en FPS deseados
+        self.PAINT_UPDATE_INTERVAL = int(1000 / fps_config["ui_update_fps"])
+        self.UI_UPDATE_INTERVAL = max(1, int(30 / fps_config["visual_fps"]))
 
         self.cross_counter = CrossLineCounter()
         self.cross_counter.counts_updated.connect(self._update_cross_counts)
@@ -59,10 +70,8 @@ class GrillaWidget(QWidget):
         self._dragging_line = None
         self._last_mouse_pos = None
 
-        # Mantiene aprox. 5 segundos previos (10 FPS) para clips de cruce
         self.frame_buffer = deque(maxlen=50)
-        # Pendientes a completar con 5 segundos posteriores al evento
-        self.pending_videos = []  # list of dicts {frames, frames_left, path}
+        self.pending_videos = []
         self.active_video_threads = []
 
         self.setFixedSize(640, 480)
@@ -70,20 +79,34 @@ class GrillaWidget(QWidget):
         self.setStyleSheet("background: transparent;")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        # Pixmap con las líneas de la grilla pre-renderizadas
         self._grid_lines_pixmap = None
         self._generate_grid_lines_pixmap()
 
-        # Atributos para la optimización de paintEvent
-        self.PAINT_UPDATE_INTERVAL = 80  # ms, para aprox. 12 FPS de UI
         self.paint_update_timer = QTimer(self)
         self.paint_update_timer.setSingleShot(True)
         self.paint_update_timer.timeout.connect(self.perform_paint_update)
         self.paint_scheduled = False
 
-        # Atributos para limitar la frecuencia de actualización de la UI por frames de video
         self.ui_frame_counter = 1
-        self.UI_UPDATE_INTERVAL = 5  # Procesar 1 de cada N frames para la UI
+        
+        # Contadores simplificados
+        self.detection_count = 0
+
+    def set_fps_config(self, visual_fps=25, detection_fps=8, ui_update_fps=15):
+        """Actualizar configuración de FPS en tiempo real"""
+        self.fps_config = {
+            "visual_fps": visual_fps,
+            "detection_fps": detection_fps, 
+            "ui_update_fps": ui_update_fps
+        }
+        
+        self.PAINT_UPDATE_INTERVAL = int(1000 / ui_update_fps)
+        self.UI_UPDATE_INTERVAL = max(1, int(30 / visual_fps))
+        
+        if hasattr(self, 'visualizador') and self.visualizador:
+            self.visualizador.update_fps_config(visual_fps, detection_fps)
+        
+        self.registrar_log(f"🎯 FPS actualizado - Visual: {visual_fps}, Detección: {detection_fps}, UI: {ui_update_fps}")
 
     def enable_cross_line(self):
         self.cross_line_enabled = True
@@ -138,7 +161,7 @@ class GrillaWidget(QWidget):
 
     def perform_paint_update(self):
         self.paint_scheduled = False
-        self.update() 
+        self.update()
 
     def request_paint_update(self):
         if not self.paint_scheduled:
@@ -146,7 +169,6 @@ class GrillaWidget(QWidget):
             self.paint_update_timer.start(self.PAINT_UPDATE_INTERVAL)
 
     def _point_to_segment_distance(self, p, a, b):
-        """Return the perpendicular distance from point p to line segment a-b."""
         ax, ay = a.x(), a.y()
         bx, by = b.x(), b.y()
         px, py = p.x(), p.y()
@@ -190,13 +212,17 @@ class GrillaWidget(QWidget):
         if "rtsp" not in cam_data:
             cam_data["rtsp"] = generar_rtsp(cam_data)
 
-        self.cam_data = cam_data
-        self.discarded_cells = set() # Limpiar antes de cargar
+        if "fps_config" not in cam_data:
+            cam_data["fps_config"] = self.fps_config
 
+        self.cam_data = cam_data
+        self.discarded_cells = set()
+
+        # Cargar celdas descartadas
         current_cam_ip = self.cam_data.get("ip")
         if current_cam_ip:
             try:
-                with open(CONFIG_FILE_PATH, 'r') as f: # CONFIG_FILE_PATH will be defined at module level
+                with open(CONFIG_FILE_PATH, 'r') as f:
                     config_data = json.load(f)
                 
                 camaras_config = config_data.get("camaras", [])
@@ -207,41 +233,47 @@ class GrillaWidget(QWidget):
                             for cell_coords in discarded_list:
                                 if isinstance(cell_coords, list) and len(cell_coords) == 2:
                                     self.discarded_cells.add(tuple(cell_coords))
-                            self.registrar_log(f"Cargadas {len(self.discarded_cells)} celdas descartadas para {current_cam_ip}")
+                            self.registrar_log(f"Cargadas {len(self.discarded_cells)} celdas descartadas")
                         break 
-            except FileNotFoundError:
-                self.registrar_log(f"Archivo de configuración '{CONFIG_FILE_PATH}' no encontrado. Iniciando sin celdas descartadas predefinidas.")
-            except json.JSONDecodeError:
-                self.registrar_log(f"Error al decodificar '{CONFIG_FILE_PATH}'. Verifique el formato del archivo.")
-            except Exception as e: # Captura genérica para otros posibles errores
-                self.registrar_log(f"Error inesperado al cargar config: {e}")
-        else:
-            self.registrar_log("No se pudo obtener la IP de la cámara para cargar celdas descartadas.")
+            except Exception as e:
+                self.registrar_log(f"Error cargando configuración: {e}")
         
         self.alertas = GestorAlertas(cam_id=str(uuid.uuid4())[:8], filas=self.filas, columnas=self.columnas)
 
-        self.visualizador  = VisualizadorDetector(cam_data)
+        self.visualizador = VisualizadorDetector(cam_data)
         if self.visualizador:
             self.detector = getattr(self.visualizador, "detectors", [])
 
         self.visualizador.result_ready.connect(self.actualizar_boxes)
         self.visualizador.log_signal.connect(self.registrar_log)
         self.visualizador.iniciar()
+        
         if self.visualizador and self.visualizador.video_sink:
-             self.visualizador.video_sink.videoFrameChanged.connect(self.actualizar_pixmap_y_frame)
+            self.visualizador.video_sink.videoFrameChanged.connect(self.actualizar_pixmap_y_frame)
+            
+        self.registrar_log(f"🎥 Vista configurada para {current_cam_ip}")
 
     def actualizar_boxes(self, boxes):
+        """Método principal que recibe las detecciones del visualizador"""
+        self.detection_count += 1
+        
+        # Solo mostrar log cada 50 detecciones para evitar spam
+        if DEBUG_LOGS and self.detection_count % 50 == 0:
+            self.registrar_log(f"📊 Detecciones procesadas: {self.detection_count}")
+        
         self.latest_tracked_boxes = boxes
+        
         if self.cross_line_enabled and self.original_frame_size:
             size = (
                 self.original_frame_size.width(),
                 self.original_frame_size.height(),
             )
             self.cross_counter.update_boxes(boxes, size)
+        
+        # Procesar detecciones para alertas
         nuevas_detecciones_para_alertas = []
         for box_data in boxes:
             if not isinstance(box_data, dict):
-                self.registrar_log(f"⚠️ formato de 'box' inesperado: {box_data}")
                 continue
 
             x1, y1, x2, y2 = box_data.get('bbox', (0, 0, 0, 0))
@@ -266,64 +298,44 @@ class GrillaWidget(QWidget):
                 if "Embarcaciones" in modelos_cam:
                     clase_nombre = "Embarcación"
                 else:
-                    clase_nombre = {0: "Persona", 2: "Auto", 9: "Barco"}.get(cls, f"Clase {cls}")
+                    clase_nombre = {0: "Persona", 2: "Auto", 8: "Barco", 9: "Barco"}.get(cls, f"Clase {cls}")
                 conf_val = conf if isinstance(conf, (int, float)) else 0.0
-                self.registrar_log(
-                    f"🟢 Movimiento (ID: {tracker_id}) - {clase_nombre} ({conf_val:.2f}) en ({cx}, {cy})"
-                )
+                
+                # Solo mostrar movimientos significativos
+                self.registrar_log(f"🟢 {clase_nombre} detectada (ID: {tracker_id}, Conf: {conf_val:.2f})")
+                    
             self.objetos_previos[cls] = current_cls_positions[-10:]
 
+        # Procesar alertas
         if self.alertas and self.last_frame is not None:
             detecciones_filtradas = []
             if self.original_frame_size and self.original_frame_size.width() > 0 and self.original_frame_size.height() > 0:
                 cell_w_video = self.original_frame_size.width() / self.columnas
                 cell_h_video = self.original_frame_size.height() / self.filas
 
-                if cell_w_video > 0 and cell_h_video > 0: # Avoid division by zero
-                    if DEBUG_LOGS:
-                        self.registrar_log(f"DEBUG: Celdas descartadas actualmente: {self.discarded_cells}")
-                    for detection_data in nuevas_detecciones_para_alertas: # Assuming items are (x1, y1, x2, y2, cls)
+                if cell_w_video > 0 and cell_h_video > 0:
+                    for detection_data in nuevas_detecciones_para_alertas:
                         x1_orig, y1_orig, x2_orig, y2_orig, cls_orig = detection_data
                         
-                        # Calculate center of the detection in original video coordinates
                         cx_orig = (x1_orig + x2_orig) / 2
                         cy_orig = (y1_orig + y2_orig) / 2
 
-                        # Determine the cell this detection falls into
-                        # Ensure cx_orig and cy_orig are within bounds before division
                         if not (0 <= cx_orig < self.original_frame_size.width() and \
                                 0 <= cy_orig < self.original_frame_size.height()):
-                            detecciones_filtradas.append(detection_data) # Keep if center is out of bounds
+                            detecciones_filtradas.append(detection_data)
                             continue
 
                         col_video = int(cx_orig / cell_w_video)
                         row_video = int(cy_orig / cell_h_video)
                         
-                        # Clamp col_video and row_video to be within grid bounds
                         col_video = max(0, min(col_video, self.columnas - 1))
                         row_video = max(0, min(row_video, self.filas - 1))
 
-                        if DEBUG_LOGS:
-                            self.registrar_log(
-                                f"DEBUG: Detección Original: {detection_data[:4]} Centro: ({cx_orig:.2f}, {cy_orig:.2f}) -> Celda: ({row_video}, {col_video})"
-                            )
                         if (row_video, col_video) not in self.discarded_cells:
                             detecciones_filtradas.append(detection_data)
-                            if DEBUG_LOGS:
-                                self.registrar_log(
-                                    f"DEBUG: Detección AÑADIDA a filtradas. Celda ({row_video}, {col_video}) NO está en descartadas."
-                                )
-                        else:
-                            if DEBUG_LOGS:
-                                self.registrar_log(
-                                    f"DEBUG: Detección IGNORADA. Celda ({row_video}, {col_video}) ESTÁ en descartadas. Coords: ({x1_orig:.0f},{y1_orig:.0f})-({x2_orig:.0f},{y2_orig:.0f})"
-                                )
-                            pass 
                 else: 
-                    # Fallback if cell dimensions are zero (should not happen if width/height > 0)
                     detecciones_filtradas = list(nuevas_detecciones_para_alertas) 
             else: 
-                # Fallback if original_frame_size is not available
                 detecciones_filtradas = list(nuevas_detecciones_para_alertas)
 
             self.alertas.procesar_detecciones(
@@ -336,7 +348,7 @@ class GrillaWidget(QWidget):
         
         self.request_paint_update() 
 
-    def actualizar_pixmap_y_frame(self, frame):  # frame es QVideoFrame
+    def actualizar_pixmap_y_frame(self, frame):
         if not frame.isValid():
             return
 
@@ -349,8 +361,6 @@ class GrillaWidget(QWidget):
         numpy_frame = None
         img_converted = None
 
-        # Intentar leer los datos mapeando el frame directamente. Esto es
-        # más eficiente cuando el formato de píxeles ya está en RGB o BGR.
         if frame.map(QVideoFrame.MapMode.ReadOnly):
             try:
                 pf = frame.pixelFormat()
@@ -392,7 +402,6 @@ class GrillaWidget(QWidget):
             finally:
                 frame.unmap()
 
-        # Si la lectura mapeada no fue posible, usar el método tradicional.
         if image is None:
             image = frame.toImage()
             if image.isNull():
@@ -417,6 +426,7 @@ class GrillaWidget(QWidget):
 
         self.last_frame = numpy_frame
         self.frame_buffer.append(numpy_frame)
+        
         for rec in list(self.pending_videos):
             if rec["frames_left"] > 0:
                 rec["frames"].append(numpy_frame)
@@ -447,13 +457,11 @@ class GrillaWidget(QWidget):
     def detener(self):
         if hasattr(self, 'visualizador') and self.visualizador: 
             self.visualizador.detener()
-            # self.visualizador = None # Keep this for later, stop processor first
         
         if hasattr(self, 'analytics_processor') and self.analytics_processor:
             self.analytics_processor.stop_processing()
-            # self.analytics_processor = None # Optionally, also set to None
 
-        if hasattr(self, 'visualizador') and self.visualizador: # Re-check as visualizador might be used by processor
+        if hasattr(self, 'visualizador') and self.visualizador:
             self.visualizador = None
         if self.detector:
              self.detector = None
@@ -490,6 +498,7 @@ class GrillaWidget(QWidget):
             elif event.button() == Qt.MouseButton.RightButton:
                 self.finish_line_edit()
             return
+        
         pos = event.pos()
         cell_w = self.width() / self.columnas
         cell_h = self.height() / self.filas
@@ -529,16 +538,14 @@ class GrillaWidget(QWidget):
 
             menu.exec(event.globalPosition().toPoint())
 
-
     def handle_discard_cells(self):
-        if not self.selected_cells: # Guard clause, though menu shouldn't appear if empty
+        if not self.selected_cells:
             return
 
         self.discarded_cells.update(self.selected_cells)
-        # Guardar la configuración
         self._save_discarded_cells_to_config() 
         self.selected_cells.clear()
-        self.request_paint_update() # Request repaint to reflect changes
+        self.request_paint_update()
 
     def handle_enable_discarded_cells(self):
         if not self.selected_cells:
@@ -546,9 +553,6 @@ class GrillaWidget(QWidget):
 
         cells_to_enable = self.selected_cells.intersection(self.discarded_cells)
         if not cells_to_enable:
-            # Si ninguna de las celdas seleccionadas está actualmente descartada,
-            # podríamos opcionalmente limpiar la selección o no hacer nada.
-            # Por ahora, limpiamos la selección para consistencia con handle_discard_cells.
             self.selected_cells.clear()
             self.request_paint_update()
             return
@@ -556,8 +560,7 @@ class GrillaWidget(QWidget):
         for cell in cells_to_enable:
             self.discarded_cells.remove(cell)
         
-        self.log_signal.emit(f"Celdas habilitadas para analíticas: {len(cells_to_enable)}") # Opcional: registrar log
-        # Guardar la configuración
+        self.registrar_log(f"Celdas habilitadas: {len(cells_to_enable)}")
         self._save_discarded_cells_to_config()
         self.selected_cells.clear()
         self.request_paint_update()
@@ -615,30 +618,27 @@ class GrillaWidget(QWidget):
 
     def _save_discarded_cells_to_config(self):
         if not self.cam_data or not self.cam_data.get("ip"):
-            self.registrar_log("Error: No se pudo obtener la IP de la cámara para guardar la configuración de celdas descartadas.")
+            self.registrar_log("Error: No se pudo obtener la IP de la cámara")
             return
 
         current_cam_ip = self.cam_data.get("ip")
-        # Convertir set de tuplas a lista de listas para JSON
-        discarded_list_for_json = sorted([list(cell) for cell in self.discarded_cells]) # Ordenar para consistencia
+        discarded_list_for_json = sorted([list(cell) for cell in self.discarded_cells])
 
         config_data = None
         try:
             with open(CONFIG_FILE_PATH, 'r') as f:
                 config_data = json.load(f)
         except FileNotFoundError:
-            self.registrar_log(f"Archivo '{CONFIG_FILE_PATH}' no encontrado. Se intentará crear uno nuevo o se asumirá una lista de cámaras vacía si no se puede cargar.")
-            config_data = {"camaras": [], "configuracion": {}} # Estructura base
+            config_data = {"camaras": [], "configuracion": {}}
         except json.JSONDecodeError:
-            self.registrar_log(f"Error crítico: El archivo de configuración '{CONFIG_FILE_PATH}' está corrupto. No se guardarán los cambios para evitar mayor pérdida de datos.")
-            return # No continuar si el JSON está corrupto
+            self.registrar_log("Error: Archivo de configuración corrupto")
+            return
         except Exception as e:
-            self.registrar_log(f"Error inesperado al leer '{CONFIG_FILE_PATH}': {e}")
+            self.registrar_log(f"Error leyendo configuración: {e}")
             return
 
-
         camara_encontrada = False
-        if "camaras" not in config_data: # Asegurar que la clave "camaras" exista
+        if "camaras" not in config_data:
             config_data["camaras"] = []
 
         for cam_config in config_data["camaras"]:
@@ -651,43 +651,50 @@ class GrillaWidget(QWidget):
             new_cam_entry = self.cam_data.copy() 
             new_cam_entry["discarded_grid_cells"] = discarded_list_for_json
             config_data["camaras"].append(new_cam_entry)
-            self.registrar_log(f"Cámara {current_cam_ip} no encontrada en config.json. Se añadió una nueva entrada.")
-
 
         try:
             with open(CONFIG_FILE_PATH, 'w') as f:
                 json.dump(config_data, f, indent=4)
-            self.registrar_log(f"Configuración de celdas descartadas guardada para la cámara {current_cam_ip} en '{CONFIG_FILE_PATH}'.")
+            self.registrar_log("✅ Configuración guardada")
         except Exception as e:
-            self.registrar_log(f"Error al escribir la configuración en '{CONFIG_FILE_PATH}': {e}")
-
-
+            self.registrar_log(f"Error guardando configuración: {e}")
 
     def paintEvent(self, event):
         super().paintEvent(event) 
         qp = QPainter(self)
+        
         if not self.pixmap or self.pixmap.isNull():
             qp.fillRect(self.rect(), QColor("black"))
             qp.setPen(QColor("white"))
             qp.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Sin señal")
             return
 
-        target_rect = QRectF(self.rect()) 
-        pixmap_size = QSizeF(self.pixmap.size()) 
-        scaled_pixmap_size = pixmap_size.scaled(target_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
-        final_draw_rect = QRectF()
-        final_draw_rect.setSize(scaled_pixmap_size) 
-        final_draw_rect.moveCenter(target_rect.center())
-        qp.drawPixmap(final_draw_rect, self.pixmap, QRectF(self.pixmap.rect()))
+        # Calcular el área donde se dibuja el video (manteniendo aspect ratio)
+        widget_rect = QRectF(self.rect())
+        pixmap_size = QSizeF(self.pixmap.size())
+        
+        # Calcular el tamaño escalado manteniendo aspect ratio
+        scaled_size = pixmap_size.scaled(widget_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        
+        # Centrar el video en el widget
+        video_rect = QRectF()
+        video_rect.setSize(scaled_size)
+        video_rect.moveCenter(widget_rect.center())
+        
+        # Dibujar el video
+        qp.drawPixmap(video_rect, self.pixmap, QRectF(self.pixmap.rect()))
 
+        # Dibujar la grilla de celdas
         cell_w = self.width() / self.columnas
         cell_h = self.height() / self.filas
+        
         for row in range(self.filas):
             for col in range(self.columnas):
                 index = row * self.columnas + col
                 estado_area = self.area[index] if index < len(self.area) else 0
                 cell_tuple = (row, col)
                 brush_color = None
+                
                 if cell_tuple in self.discarded_cells:
                     brush_color = QColor(200, 0, 0, 150)
                 elif cell_tuple in self.selected_cells:
@@ -696,22 +703,29 @@ class GrillaWidget(QWidget):
                     brush_color = QColor(0, 255, 0, 100)
                 elif estado_area == 1:
                     brush_color = QColor(255, 165, 0, 100)
+                    
                 if brush_color is not None:
                     rect_to_draw = QRectF(col * cell_w, row * cell_h, cell_w, cell_h)
                     qp.fillRect(rect_to_draw, brush_color)
 
+        # Dibujar líneas de la grilla
         if self._grid_lines_pixmap:
             qp.drawPixmap(self.rect(), self._grid_lines_pixmap)
 
+        # Dibujar las cajas de detección con coordenadas corregidas
         if self.latest_tracked_boxes and self.original_frame_size:
             orig_frame_w = self.original_frame_size.width()
             orig_frame_h = self.original_frame_size.height()
-            if orig_frame_w == 0 or orig_frame_h == 0: return
+            
+            if orig_frame_w == 0 or orig_frame_h == 0:
+                return
 
-            scale_x = final_draw_rect.width() / orig_frame_w
-            scale_y = final_draw_rect.height() / orig_frame_h
-            offset_x = final_draw_rect.left()
-            offset_y = final_draw_rect.top()
+            # CORRECCIÓN CLAVE: Usar las dimensiones del área real del video, no del widget completo
+            scale_x = video_rect.width() / orig_frame_w
+            scale_y = video_rect.height() / orig_frame_h
+            offset_x = video_rect.left()
+            offset_y = video_rect.top()
+            
             font = QFont()
             font.setPointSize(10)
             qp.setFont(font)
@@ -720,45 +734,78 @@ class GrillaWidget(QWidget):
                 if not isinstance(box_data, dict):
                     continue
 
-                x1, y1, x2, y2 = box_data.get('bbox', (0, 0, 0, 0))
-                tracker_id = box_data.get('id')
-                conf = box_data.get('conf')
+                bbox = box_data.get('bbox', (0, 0, 0, 0))
+                if len(bbox) != 4:
+                    continue
+                    
+                x1, y1, x2, y2 = bbox
+                tracker_id = box_data.get('id', 'N/A')
+                conf = box_data.get('conf', 0)
                 conf_val = conf if isinstance(conf, (int, float)) else 0.0
 
+                # Aplicar escalado y offset correctos
                 scaled_x1 = (x1 * scale_x) + offset_x
                 scaled_y1 = (y1 * scale_y) + offset_y
                 scaled_x2 = (x2 * scale_x) + offset_x
                 scaled_y2 = (y2 * scale_y) + offset_y
+                
                 scaled_w = scaled_x2 - scaled_x1
                 scaled_h = scaled_y2 - scaled_y1
+                
+                # Verificar que las coordenadas estén dentro del área del video
+                if (scaled_x1 < video_rect.left() or scaled_y1 < video_rect.top() or 
+                    scaled_x2 > video_rect.right() or scaled_y2 > video_rect.bottom()):
+                    # Las coordenadas están fuera del área del video, skip
+                    continue
+                
+                # Dibujar el rectángulo de detección
                 pen = QPen()
-                pen.setWidth(2)
-                pen.setColor(QColor("blue"))
+                pen.setWidth(3)
+                pen.setColor(QColor("lime"))  # Verde más visible
                 qp.setPen(pen)
                 qp.setBrush(Qt.BrushStyle.NoBrush)
                 qp.drawRect(QRectF(scaled_x1, scaled_y1, scaled_w, scaled_h))
+                
+                # Determinar estado de movimiento
                 moving_state = box_data.get('moving')
                 if moving_state is None:
                     estado = 'Procesando'
                 else:
                     estado = 'En movimiento' if moving_state else 'Detenido'
+                
+                # Preparar texto de la etiqueta
                 label_text = f"ID:{tracker_id} C:{conf_val:.2f} {estado}"
+                
+                # Dibujar fondo para el texto
+                text_rect = qp.fontMetrics().boundingRect(label_text)
+                text_bg_rect = QRectF(scaled_x1, scaled_y1 - text_rect.height() - 2, 
+                                     text_rect.width() + 4, text_rect.height() + 2)
+                
+                # Si el texto se sale por arriba, ponerlo abajo del box
+                if text_bg_rect.top() < video_rect.top():
+                    text_bg_rect.moveTop(scaled_y2 + 2)
+                
+                qp.fillRect(text_bg_rect, QColor(0, 0, 0, 180))  # Fondo semi-transparente
+                
+                # Dibujar el texto
                 qp.setPen(QColor("white"))
-                text_x = scaled_x1
-                text_y = scaled_y1 - 5
-
-                if text_y < 10 : text_y = scaled_y1 + 15
+                text_x = text_bg_rect.left() + 2
+                text_y = text_bg_rect.bottom() - 2
                 qp.drawText(QPointF(text_x, text_y), label_text)
+
+        # Dibujar línea de conteo si está activa
         if hasattr(self, 'cross_counter') and self.cross_line_enabled:
             x1_rel, y1_rel = self.cross_counter.line[0]
             x2_rel, y2_rel = self.cross_counter.line[1]
+            
             pen = QPen(QColor('yellow'))
-            pen.setWidth(2)
+            pen.setWidth(3)
             qp.setPen(pen)
             qp.drawLine(
                 QPointF(x1_rel * self.width(), y1_rel * self.height()),
                 QPointF(x2_rel * self.width(), y2_rel * self.height()),
             )
+            
             if self.cross_line_edit_mode:
                 handle_pen = QPen(QColor('red'))
                 handle_pen.setWidth(4)
@@ -767,15 +814,16 @@ class GrillaWidget(QWidget):
                 size = 6
                 qp.drawEllipse(QPointF(x1_rel * self.width(), y1_rel * self.height()), size, size)
                 qp.drawEllipse(QPointF(x2_rel * self.width(), y2_rel * self.height()), size, size)
+            
+            # Mostrar conteos
             counts_parts = []
             for direc in ("Entrada", "Salida"):
                 sub = self.cross_counts.get(direc, {})
                 if sub:
                     sub_text = ", ".join(f"{v} {k}" for k, v in sub.items())
                     counts_parts.append(f"{direc}: {sub_text}")
+            
             counts_text = " | ".join(counts_parts)
             if counts_text:
                 qp.setPen(QColor('yellow'))
                 qp.drawText(QPointF(x2_rel * self.width() + 5, y2_rel * self.height()), counts_text)
-        else:
-            pass
