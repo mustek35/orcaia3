@@ -9,12 +9,13 @@ import importlib
 from ui.camera_modal import CameraDialog
 from gui.resumen_detecciones import ResumenDeteccionesWidget
 from ui.config_modal import ConfiguracionDialog
+from ui.fps_config_dialog import FPSConfigDialog
 from ui.camera_manager import guardar_camaras, cargar_camaras_guardadas
 from core.rtsp_builder import generar_rtsp
 import os
-import cProfile # Añadido para profiling
-import pstats   # Añadido para profiling
-import io       # Añadido para profiling
+import cProfile
+import pstats
+import io
 
 CONFIG_PATH = "config.json"
 
@@ -28,6 +29,14 @@ class MainGUI(QMainWindow):
 
         self.setWindowTitle("Monitor PTZ Inteligente - Orca")
         self.setGeometry(100, 100, 1600, 900)
+
+        # Configuración de FPS por defecto
+        self.fps_config = {
+            "visual_fps": 25,
+            "detection_fps": 8, 
+            "ui_update_fps": 15,
+            "adaptive_fps": True
+        }
 
         self.camera_data_list = []
         self.camera_widgets = [] 
@@ -56,6 +65,11 @@ class MainGUI(QMainWindow):
         self.action_ver_config.triggered.connect(self.abrir_configuracion_modal)
         self.menu_config.addAction(self.action_ver_config)
 
+        # Agregar acción de FPS al menú
+        self.action_fps_config = QAction("🎯 Configurar FPS", self)
+        self.action_fps_config.triggered.connect(self.abrir_fps_config)
+        self.menu_config.addAction(self.action_fps_config)
+
         self.action_edit_line = QAction("🏁 Línea de Cruce", self)
         self.action_edit_line.triggered.connect(self.toggle_line_edit)
         self.menu_config.addAction(self.action_edit_line)
@@ -72,6 +86,65 @@ class MainGUI(QMainWindow):
 
         cargar_camaras_guardadas(self)
 
+    def abrir_fps_config(self):
+        """Abrir diálogo de configuración de FPS"""
+        dialog = FPSConfigDialog(self, self.fps_config)
+        dialog.fps_config_changed.connect(self.update_fps_config)
+        
+        if dialog.exec():
+            self.fps_config = dialog.get_config()
+            self.apply_fps_to_all_cameras()
+            self.append_debug(f"⚙️ Configuración de FPS aplicada: {self.fps_config}")
+    
+    def update_fps_config(self, config):
+        """Actualizar configuración de FPS en tiempo real"""
+        self.fps_config = config
+        self.apply_fps_to_all_cameras()
+        self.append_debug(f"🎯 FPS actualizado en tiempo real: Visual={config['visual_fps']}, "
+                         f"Detección={config['detection_fps']}, UI={config['ui_update_fps']}")
+    
+    def apply_fps_to_all_cameras(self):
+        """Aplicar configuración de FPS a todas las cámaras activas"""
+        for widget in self.camera_widgets:
+            try:
+                # Actualizar GrillaWidget
+                if hasattr(widget, 'set_fps_config'):
+                    widget.set_fps_config(
+                        visual_fps=self.fps_config['visual_fps'],
+                        detection_fps=self.fps_config['detection_fps'],
+                        ui_update_fps=self.fps_config['ui_update_fps']
+                    )
+                
+                # Actualizar VisualizadorDetector
+                if hasattr(widget, 'visualizador') and widget.visualizador:
+                    if hasattr(widget.visualizador, 'update_fps_config'):
+                        widget.visualizador.update_fps_config(
+                            visual_fps=self.fps_config['visual_fps'],
+                            detection_fps=self.fps_config['detection_fps']
+                        )
+                        
+            except Exception as e:
+                self.append_debug(f"❌ Error aplicando FPS a cámara: {e}")
+
+    def get_optimized_fps_for_camera(self, camera_data):
+        """Obtener configuración de FPS optimizada según el tipo de cámara"""
+        base_config = self.fps_config.copy()
+        
+        # Ajustar según el tipo de cámara
+        camera_type = camera_data.get('tipo', 'fija')
+        models = camera_data.get('modelos', [camera_data.get('modelo', 'Personas')])
+        
+        if camera_type == 'ptz':
+            # PTZ necesita más FPS para seguimiento fluido
+            base_config['visual_fps'] = min(30, base_config['visual_fps'] + 5)
+            base_config['detection_fps'] = min(15, base_config['detection_fps'] + 2)
+        
+        if 'Embarcaciones' in models or 'Barcos' in models:
+            # Detección marítima puede necesitar menos FPS
+            base_config['detection_fps'] = max(3, base_config['detection_fps'] - 2)
+        
+        return base_config
+
     def append_debug(self, message: str):
         if any(substr in message for substr in ["hevc @", "VPS 0", "undecodable NALU", "Frame procesado"]):
             return
@@ -80,7 +153,7 @@ class MainGUI(QMainWindow):
     def setup_inicio_ui(self):
         from PyQt6.QtWidgets import QSplitter
 
-          # --- Parte superior: cámaras ---
+        # --- Parte superior: cámaras ---
         self.video_grid = QGridLayout()
         video_grid_container_widget = QWidget()
         video_grid_container_widget.setLayout(self.video_grid)
@@ -91,7 +164,7 @@ class MainGUI(QMainWindow):
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll_area.setWidget(video_grid_container_widget)
 
-    # --- Parte inferior: lista + log + resumen ---
+        # --- Parte inferior: lista + log + resumen ---
         bottom_layout = QHBoxLayout()
     
         self.camera_list = QListWidget()
@@ -111,14 +184,13 @@ class MainGUI(QMainWindow):
         bottom_widget = QWidget()
         bottom_widget.setLayout(bottom_layout)
 
-    # --- Dividir con splitter vertical ---
+        # --- Dividir con splitter vertical ---
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(scroll_area)
         splitter.addWidget(bottom_widget)
         splitter.setSizes([1, 1])  # 50% y 50%
 
         self.init_tab_layout.addWidget(splitter)
-
 
     def open_camera_dialog(self, index=None):
         print("🛠️ [DEBUG] Ejecutando open_camera_dialog")
@@ -143,11 +215,8 @@ class MainGUI(QMainWindow):
 
     def abrir_configuracion_modal(self):
         dialog = ConfiguracionDialog(self, camera_list=self.camera_data_list)
-        # dialog.exec() returns True if accepted, False if rejected or closed.
-        # For QDialog, QDialog.DialogCode.Accepted (an enum value, typically 1) is often checked.
-        # However, PyQt6's QDialog.exec() returns bool directly for common cases.
-        if dialog.exec(): # True if OK/Accepted was pressed
-            guardar_camaras(self) # Call the save function
+        if dialog.exec():
+            guardar_camaras(self)
             self.append_debug(f"⚙️ Configuración del sistema guardada.")
         else:
             self.append_debug(f"⚙️ Cambios en configuración del sistema cancelados.")
@@ -166,6 +235,10 @@ class MainGUI(QMainWindow):
             widget.start_line_edit()
 
     def start_camera_stream(self, camera_data):
+        # Agregar configuración de FPS optimizada a los datos de la cámara
+        optimized_fps = self.get_optimized_fps_for_camera(camera_data)
+        camera_data['fps_config'] = optimized_fps
+
         for i, widget in enumerate(self.camera_widgets):
             if hasattr(widget, 'cam_data') and widget.cam_data.get('ip') == camera_data.get('ip'):
                 print(f"INFO: Reemplazando widget para cámara IP: {camera_data.get('ip')}")
@@ -177,11 +250,10 @@ class MainGUI(QMainWindow):
         
         video_grid_container_widget = None
         # Buscar el video_grid_container_widget que es el widget del scroll_area
-        # Esto es un poco indirecto, sería mejor tener una referencia directa si es posible
         for i in range(self.init_tab_layout.count()):
             item = self.init_tab_layout.itemAt(i)
             if isinstance(item.widget(), QScrollArea):
-                video_grid_container_widget = item.widget().widget() # El widget dentro del QScrollArea
+                video_grid_container_widget = item.widget().widget()
                 break
 
         try:
@@ -192,10 +264,8 @@ class MainGUI(QMainWindow):
             self.append_debug(f"ERROR: No se pudo importar GrillaWidget: {e}")
             return
 
-        # Usar video_grid_container_widget como parent si se encontró, sino self.
-        # El parent debe ser un QWidget. self.video_grid es un QLayout.
         parent_widget = video_grid_container_widget if video_grid_container_widget else self
-        video_widget = GrillaWidget_class(parent=parent_widget) 
+        video_widget = GrillaWidget_class(parent=parent_widget, fps_config=optimized_fps) 
         
         video_widget.cam_data = camera_data 
         video_widget.log_signal.connect(self.append_debug)
@@ -208,7 +278,7 @@ class MainGUI(QMainWindow):
         
         video_widget.mostrar_vista(camera_data) 
         video_widget.show()
-        self.append_debug(f"🎥 Reproduciendo: {camera_data.get('ip', 'IP Desconocida')}")
+        self.append_debug(f"🎥 Reproduciendo: {camera_data.get('ip', 'IP Desconocida')} con FPS optimizado")
 
     def show_camera_menu(self, position):
         item = self.camera_list.itemAt(position)
@@ -218,6 +288,7 @@ class MainGUI(QMainWindow):
             edit_action = menu.addAction("✏️ Editar Cámara")
             delete_action = menu.addAction("🗑️ Eliminar Cámara")
             stop_action = menu.addAction("⛔ Detener Visual") 
+            fps_action = menu.addAction("🎯 Configurar FPS Individual")
             action = menu.exec(self.camera_list.mapToGlobal(position))
 
             if action == edit_action:
@@ -241,6 +312,30 @@ class MainGUI(QMainWindow):
                         widget.detener()
                         self.append_debug(f"⛔ Visual detenida para: {cam_ip_to_stop}")
                         break
+            elif action == fps_action:
+                self.configure_individual_fps(index)
+
+    def configure_individual_fps(self, camera_index):
+        """Configurar FPS individual para una cámara específica"""
+        if camera_index >= len(self.camera_widgets):
+            return
+            
+        widget = self.camera_widgets[camera_index]
+        current_fps = widget.fps_config if hasattr(widget, 'fps_config') else self.fps_config
+        
+        dialog = FPSConfigDialog(self, current_fps)
+        dialog.setWindowTitle(f"🎯 FPS para {self.camera_data_list[camera_index].get('ip', 'Cámara')}")
+        
+        def apply_individual_fps(config):
+            widget.set_fps_config(
+                visual_fps=config['visual_fps'],
+                detection_fps=config['detection_fps'],
+                ui_update_fps=config['ui_update_fps']
+            )
+            self.append_debug(f"🎯 FPS individual aplicado a {widget.cam_data.get('ip', 'Cámara')}")
+        
+        dialog.fps_config_changed.connect(apply_individual_fps)
+        dialog.exec()
 
     def restart_all_cameras(self):
         for widget in list(self.camera_widgets):
@@ -298,9 +393,8 @@ class MainGUI(QMainWindow):
         print(f"INFO: Resultados del profiler guardados en {stats_filename}")
 
         s = io.StringIO()
-        # Ordenar por 'cumulative' (tiempo acumulado) y luego por 'tottime' (tiempo total interno)
         ps = pstats.Stats(self.profiler, stream=s).sort_stats('cumulative', 'tottime')
-        ps.print_stats(30) # Imprime las 30 funciones más costosas
+        ps.print_stats(30)
         print("\n--- Resumen del Profiler (Top 30 por tiempo acumulado) ---")
         print(s.getvalue())
         print("--- Fin del Resumen del Profiler ---\n")
