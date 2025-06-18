@@ -1,0 +1,26 @@
+{
+    "ptz_cameras": [],
+    "global_settings": {
+        "auto_start_tracking": false,
+        "log_level": "INFO",
+        "max_tracking_distance": 0.3,
+        "tracking_timeout": 10.0,
+        "grid_dimensions": {
+            "rows": 12,
+            "columns": 16
+        },
+        "detection_filters": {
+            "min_confidence": 0.3,
+            "allowed_object_types": [
+                "person",
+                "vehicle",
+                "boat",
+                "ship"
+            ],
+            "ignore_small_objects": true,
+            "min_object_size": 50
+        }
+    },
+    "version": "1.0",
+    "created_date": "2025-06-17T16:18:30.779978"
+}

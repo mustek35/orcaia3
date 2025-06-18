@@ -1,0 +1,13 @@
+{
+    "integration_date": "2025-06-17T16:18:30.779978",
+    "ptz_system_version": "1.0",
+    "integrated_components": [
+        "ptz_tracking_system",
+        "light_api",
+        "ptz_config_widget",
+        "detection_ptz_bridge"
+    ],
+    "integration_status": "setup_completed",
+    "folder_structure_created": true,
+    "backup_enabled": true
+}
