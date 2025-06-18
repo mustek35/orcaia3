@@ -1,0 +1,1 @@
+Pillow>=8.0.0\nPyQt6>=6.0.0\nnumpy>=1.20.0\nrequests>=2.25.0\n
