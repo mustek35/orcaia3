@@ -322,6 +322,18 @@ class PTZSystemIntegration:
         except Exception as e:
             logger.error(f"Error obteniendo estado de seguimiento: {e}")
             return {}
+
+    def get_status(self) -> Dict[str, Dict]:
+        """Alias para compatibilidad retroactiva.
+
+        Algunos módulos antiguos aún llaman a ``get_status`` para
+        obtener el estado de las cámaras PTZ.  Desde versiones
+        recientes el método público se denomina
+        :func:`get_tracking_status`.  Esta función simplemente delega
+        la llamada para mantener compatibilidad con esos módulos.
+        """
+
+        return self.get_tracking_status()
     
     def register_detection_callback(self, callback: Callable):
         """
