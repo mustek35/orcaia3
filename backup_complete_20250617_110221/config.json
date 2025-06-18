@@ -1,0 +1,81 @@
+{
+    "camaras": [
+        {
+            "ip": "19.10.10.132",
+            "usuario": "root",
+            "contrasena": "@Remoto753524",
+            "tipo": "fija",
+            "fps_config": {
+                "visual_fps": 60,
+                "detection_fps": 30,
+                "ui_update_fps": 30,
+                "adaptive_fps": true
+            },
+            "rtsp": "rtsp://root:%40Remoto753524@19.10.10.132:554/media/video1"
+        },
+        {
+            "ip": "19.10.10.217",
+            "usuario": "root",
+            "contrasena": "@Remoto753524",
+            "tipo": "ptz",
+            "rtsp": "rtsp://root:%40Remoto753524@19.10.10.217:554/media/video1",
+            "modelo": "Barcos",
+            "modelos": [
+                "Barcos"
+            ],
+            "confianza": 0.15,
+            "intervalo": 60,
+            "imgsz": 1920,
+            "device": "cuda",
+            "resolucion": "main",
+            "umbral": 0.34,
+            "guardar_capturas": true,
+            "modo_centinela": false,
+            "lost_ttl": 5,
+            "fps_config": {
+                "visual_fps": 30,
+                "detection_fps": 13,
+                "ui_update_fps": 30,
+                "adaptive_fps": true
+            },
+            "discarded_grid_cells": []
+        },
+        {
+            "ip": "19.10.10.83",
+            "usuario": "orca",
+            "contrasena": "@Remoto753524",
+            "tipo": "fija",
+            "fps_config": {
+                "visual_fps": 60,
+                "detection_fps": 30,
+                "ui_update_fps": 30,
+                "adaptive_fps": true
+            },
+            "rtsp": "rtsp://orca:%40Remoto753524@19.10.10.83:554/media/video1",
+            "modelos": [
+                "Personas",
+                "Autos"
+            ],
+            "modelo": "Personas",
+            "confianza": 0.25000000000000006,
+            "intervalo": 30,
+            "imgsz": 1280,
+            "resolucion": "main",
+            "umbral": 0.5,
+            "guardar_capturas": false,
+            "modo_centinela": false
+        }
+    ],
+    "configuracion": {
+        "resolucion": "main",
+        "umbral": 0.5,
+        "guardar_capturas": false,
+        "modo_centinela": false,
+        "fps_global": {
+            "visual_fps": 25,
+            "detection_fps": 8,
+            "ui_update_fps": 15,
+            "adaptive_fps": true
+        }
+    }
+}

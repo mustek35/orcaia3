@@ -1,0 +1,1006 @@
+"""
+Pipeline CUDA completo para procesamiento de video en GPU.
+Implementa preprocessing, inferencia y postprocessing optimizado para RTX 3050.
+"""
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import numpy as np
+import cv2
+import time
+import threading
+from collections import deque
+from typing import Optional, List, Dict, Tuple
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from ultralytics import YOLO
+from logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+class CUDAMemoryPool:
+    """Pool de memoria CUDA para evitar allocaciones/deallocaciones frecuentes"""
+    
+    def __init__(self, device='cuda:0', max_pool_size=1024*1024*1024):  # 1GB default
+        self.device = device
+        self.max_pool_size = max_pool_size
+        self.pools = {}
+        self.usage_stats = {
+            'allocations': 0,
+            'deallocations': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'current_usage': 0
+        }
+        
+    def get_tensor(self, shape, dtype=torch.float32):
+        """Obtiene un tensor de memoria pool o crea uno nuevo"""
+        try:
+            key = (tuple(shape), dtype)
+            
+            if key in self.pools and len(self.pools[key]) > 0:
+                tensor = self.pools[key].pop()
+                self.usage_stats['cache_hits'] += 1
+                return tensor
+            
+            # Crear nuevo tensor
+            tensor = torch.empty(shape, dtype=dtype, device=self.device)
+            self.usage_stats['cache_misses'] += 1
+            self.usage_stats['allocations'] += 1
+            
+            return tensor
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo tensor del pool: {e}")
+            # Fallback a allocación directa
+            return torch.empty(shape, dtype=dtype, device=self.device)
+    
+    def return_tensor(self, tensor):
+        """Retorna un tensor al pool para reutilización"""
+        try:
+            if tensor.device.type != 'cuda':
+                return
+            
+            key = (tuple(tensor.shape), tensor.dtype)
+            
+            if key not in self.pools:
+                self.pools[key] = []
+            
+            # Limitar tamaño del pool
+            if len(self.pools[key]) < 10:  # Max 10 tensores por tipo
+                self.pools[key].append(tensor)
+                self.usage_stats['deallocations'] += 1
+            
+        except Exception as e:
+            logger.error(f"Error retornando tensor al pool: {e}")
+    
+    def cleanup(self):
+        """Limpia el pool y libera memoria"""
+        try:
+            for pool in self.pools.values():
+                pool.clear()
+            self.pools.clear()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logger.info("Memory pool limpiado")
+            
+        except Exception as e:
+            logger.error(f"Error limpiando memory pool: {e}")
+    
+    def get_stats(self):
+        """Obtiene estadísticas del pool"""
+        total_tensors = sum(len(pool) for pool in self.pools.values())
+        return {
+            **self.usage_stats,
+            'total_cached_tensors': total_tensors,
+            'pool_types': len(self.pools)
+        }
+
+
+class CUDAPipelineProcessor(QObject):
+    """
+    Procesador de pipeline CUDA completo optimizado para RTX 3050.
+    
+    Características:
+    - Preprocessing en GPU con kernels CUDA
+    - Batch processing inteligente
+    - Memory pooling para evitar allocaciones
+    - Pipeline asíncrono con streams CUDA
+    - Optimizaciones específicas para RTX 3050
+    """
+    
+    # Señales
+    results_ready = pyqtSignal(list, dict)  # resultados, metadata
+    performance_stats = pyqtSignal(dict)    # estadísticas
+    error_occurred = pyqtSignal(str)        # errores
+    
+    def __init__(self, model_config=None, device='cuda:0'):
+        super().__init__()
+        
+        self.device = device
+        self.model_config = model_config or self._get_default_model_config()
+        
+        # Verificar disponibilidad CUDA
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA no disponible")
+        
+        # Configurar device
+        torch.cuda.set_device(device)
+        
+        # Memory pool optimizado
+        self.memory_pool = CUDAMemoryPool(device)
+        
+        # Streams CUDA para procesamiento asíncrono
+        self.preprocessing_stream = torch.cuda.Stream()
+        self.inference_stream = torch.cuda.Stream()
+        self.postprocessing_stream = torch.cuda.Stream()
+        
+        # Modelo YOLO
+        self.model = None
+        self.model_loaded = False
+        
+        # Buffers y colas
+        self.input_queue = deque(maxlen=8)
+        self.processing_queue = deque(maxlen=4)
+        self.output_queue = deque(maxlen=4)
+        
+        # Threading
+        self.processing_thread = None
+        self.running = False
+        self.queue_lock = threading.Lock()
+        
+        # Estadísticas de rendimiento
+        self.stats = {
+            'fps': 0.0,
+            'preprocessing_time': 0.0,
+            'inference_time': 0.0,
+            'postprocessing_time': 0.0,
+            'total_pipeline_time': 0.0,
+            'queue_sizes': {'input': 0, 'processing': 0, 'output': 0},
+            'memory_usage': 0.0,
+            'gpu_utilization': 0.0,
+            'batch_efficiency': 0.0,
+            'frames_processed': 0,
+            'frames_dropped': 0
+        }
+        
+        # Contadores
+        self.frame_count = 0
+        self.last_stats_time = time.time()
+        
+        # Configurar optimizaciones CUDA
+        self._setup_cuda_optimizations()
+        
+        logger.info(f"CUDAPipelineProcessor inicializado en {device}")
+    
+    def _get_default_model_config(self):
+        """Configuración por defecto del modelo"""
+        return {
+            'model_path': 'yolov8m.pt',
+            'input_size': (640, 640),
+            'confidence_threshold': 0.5,
+            'nms_threshold': 0.4,
+            'max_detections': 300,
+            'batch_size': 4,  # Óptimo para RTX 3050
+            'half_precision': True,  # FP16
+            'compile_model': True,   # PyTorch 2.0 compile
+            'classes': None,  # Todas las clases por defecto
+        }
+    
+    def _setup_cuda_optimizations(self):
+        """Configura optimizaciones específicas de CUDA"""
+        try:
+            # Configuraciones globales PyTorch
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Configurar memoria
+            torch.cuda.empty_cache()
+            
+            # Información de la GPU
+            gpu_props = torch.cuda.get_device_properties(self.device)
+            logger.info(f"GPU: {gpu_props.name}")
+            logger.info(f"Memoria total: {gpu_props.total_memory / 1024**3:.1f} GB")
+            logger.info(f"Compute capability: {gpu_props.major}.{gpu_props.minor}")
+            
+            # Configurar memory pool si es RTX 3050
+            if "3050" in gpu_props.name:
+                # Configuración específica para RTX 3050
+                self.memory_pool.max_pool_size = int(gpu_props.total_memory * 0.8)  # 80% de VRAM
+                self.model_config['batch_size'] = 4  # Batch óptimo
+                logger.info("Optimizaciones RTX 3050 aplicadas")
+            
+        except Exception as e:
+            logger.error(f"Error configurando optimizaciones CUDA: {e}")
+    
+    def load_model(self, model_path=None):
+        """Carga y optimiza el modelo YOLO"""
+        try:
+            model_path = model_path or self.model_config['model_path']
+            logger.info(f"Cargando modelo: {model_path}")
+            
+            # Cargar modelo YOLO
+            self.model = YOLO(model_path)
+            
+            # Mover a GPU
+            self.model.to(self.device)
+            
+            # Configurar para inferencia
+            self.model.eval()
+            
+            # Optimizaciones específicas
+            if self.model_config['half_precision']:
+                self.model.half()
+                logger.info("Modelo convertido a FP16")
+            
+            # Compilar modelo (PyTorch 2.0+)
+            if self.model_config.get('compile_model', False) and hasattr(torch, 'compile'):
+                try:
+                    self.model.model = torch.compile(
+                        self.model.model,
+                        mode='reduce-overhead',  # Optimizar para latencia
+                        fullgraph=True
+                    )
+                    logger.info("Modelo compilado con torch.compile")
+                except Exception as e:
+                    logger.warning(f"No se pudo compilar el modelo: {e}")
+            
+            # Warmup del modelo
+            self._warmup_model()
+            
+            self.model_loaded = True
+            logger.info("Modelo cargado y optimizado exitosamente")
+            
+        except Exception as e:
+            logger.error(f"Error cargando modelo: {e}")
+            raise
+    
+    def _warmup_model(self):
+        try:
+            # Obtener dimensiones de forma segura
+            input_size = self.model_config.get('input_size', 640)
+            
+            if isinstance(input_size, (list, tuple)):
+                height = int(input_size[0]) if len(input_size) > 0 else 640
+                width = int(input_size[1]) if len(input_size) > 1 else height
+            else:
+                height = width = int(input_size)
+            
+            # Crear tensor de warmup
+            warmup_tensor = torch.randn(1, 3, height, width, device=self.device)
+            
+            for i in range(self.model_config.get('warmup_iterations', 3)):
+                with torch.no_grad():
+                    _ = self.model(warmup_tensor)
+            
+            logger.info("Warmup del modelo completado")
+            
+        except Exception as e:
+            logger.warning(f"Error en warmup: {e}")
+    def start_processing(self):
+        """Inicia el procesamiento del pipeline"""
+        if self.running:
+            logger.warning("Pipeline ya está ejecutándose")
+            return
+        
+        if not self.model_loaded:
+            raise RuntimeError("Modelo no cargado")
+        
+        try:
+            self.running = True
+            self.processing_thread = threading.Thread(
+                target=self._processing_loop,
+                daemon=True,
+                name="CUDAPipeline"
+            )
+            self.processing_thread.start()
+            
+            logger.info("Pipeline CUDA iniciado")
+            
+        except Exception as e:
+            logger.error(f"Error iniciando pipeline: {e}")
+            self.running = False
+            raise
+    
+    def stop_processing(self):
+        """Detiene el procesamiento del pipeline"""
+        if not self.running:
+            return
+        
+        logger.info("Deteniendo pipeline CUDA...")
+        
+        self.running = False
+        
+        # Esperar a que termine el thread
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=5.0)
+        
+        # Limpiar recursos
+        self._cleanup_resources()
+        
+        logger.info("Pipeline CUDA detenido")
+    
+    def _cleanup_resources(self):
+        """Limpia recursos CUDA"""
+        try:
+            # Limpiar colas
+            with self.queue_lock:
+                self.input_queue.clear()
+                self.processing_queue.clear()
+                self.output_queue.clear()
+            
+            # Limpiar memory pool
+            self.memory_pool.cleanup()
+            
+            # Sincronizar streams
+            self.preprocessing_stream.synchronize()
+            self.inference_stream.synchronize()
+            self.postprocessing_stream.synchronize()
+            
+            # Limpiar caché CUDA
+            torch.cuda.empty_cache()
+            
+            logger.info("Recursos CUDA limpiados")
+            
+        except Exception as e:
+            logger.error(f"Error limpiando recursos: {e}")
+    
+    def add_frame(self, frame: np.ndarray, metadata: Dict = None):
+        """Agrega un frame al pipeline para procesamiento"""
+        try:
+            if not self.running:
+                return False
+            
+            frame_data = {
+                'frame': frame,
+                'metadata': metadata or {},
+                'timestamp': time.time(),
+                'frame_id': self.frame_count
+            }
+            
+            with self.queue_lock:
+                if len(self.input_queue) >= self.input_queue.maxlen:
+                    # Descartar frame más antiguo
+                    dropped = self.input_queue.popleft()
+                    self.stats['frames_dropped'] += 1
+                    logger.debug(f"Frame {dropped['frame_id']} descartado")
+                
+                self.input_queue.append(frame_data)
+                self.stats['queue_sizes']['input'] = len(self.input_queue)
+            
+            self.frame_count += 1
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error agregando frame: {e}")
+            return False
+    
+    def _processing_loop(self):
+        """Loop principal de procesamiento"""
+        logger.info("Iniciando loop de procesamiento CUDA")
+        
+        while self.running:
+            try:
+                # Obtener batch de frames para procesar
+                batch_data = self._get_processing_batch()
+                
+                if not batch_data:
+                    time.sleep(0.001)  # Sleep mínimo
+                    continue
+                
+                # Procesar batch
+                results = self._process_batch(batch_data)
+                
+                # Emitir resultados
+                if results:
+                    for result in results:
+                        self.results_ready.emit(result['detections'], result['metadata'])
+                
+                # Actualizar estadísticas
+                self._update_performance_stats()
+                
+            except Exception as e:
+                logger.error(f"Error en loop de procesamiento: {e}")
+                time.sleep(0.1)
+        
+        logger.info("Loop de procesamiento terminado")
+    
+    def _get_processing_batch(self):
+        """Obtiene un batch de frames para procesar"""
+        try:
+            batch_data = []
+            target_batch_size = self.model_config['batch_size']
+            
+            with self.queue_lock:
+                # Obtener frames hasta completar batch o vaciar cola
+                while len(batch_data) < target_batch_size and self.input_queue:
+                    frame_data = self.input_queue.popleft()
+                    batch_data.append(frame_data)
+                
+                self.stats['queue_sizes']['input'] = len(self.input_queue)
+            
+            return batch_data if batch_data else None
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo batch: {e}")
+            return None
+    
+    def _process_batch(self, batch_data):
+        """Procesa un batch de frames"""
+        try:
+            start_time = time.time()
+            
+            # Preprocessing en GPU
+            preprocessing_start = time.time()
+            preprocessed_batch = self._preprocess_batch(batch_data)
+            preprocessing_time = time.time() - preprocessing_start
+            
+            if preprocessed_batch is None:
+                return None
+            
+            # Inferencia
+            inference_start = time.time()
+            inference_results = self._run_inference_batch(preprocessed_batch)
+            inference_time = time.time() - inference_start
+            
+            # Postprocessing
+            postprocessing_start = time.time()
+            final_results = self._postprocess_batch(inference_results, batch_data)
+            postprocessing_time = time.time() - postprocessing_start
+            
+            # Actualizar estadísticas de timing
+            total_time = time.time() - start_time
+            self.stats.update({
+                'preprocessing_time': preprocessing_time * 1000,  # ms
+                'inference_time': inference_time * 1000,
+                'postprocessing_time': postprocessing_time * 1000,
+                'total_pipeline_time': total_time * 1000,
+                'frames_processed': self.stats['frames_processed'] + len(batch_data)
+            })
+            
+            return final_results
+            
+        except Exception as e:
+            logger.error(f"Error procesando batch: {e}")
+            return None
+    
+    def _preprocess_batch(self, batch_data):
+        """Preprocesa un batch de frames en GPU"""
+        try:
+            with torch.cuda.stream(self.preprocessing_stream):
+                batch_size = len(batch_data)
+                input_size = self.model_config.get('input_size', 640)
+                
+                # Obtener tensor del pool
+                dtype = torch.half if self.model_config['half_precision'] else torch.float32
+                batch_tensor = self.memory_pool.get_tensor(
+                    (batch_size, 3, (input_size if isinstance(input_size, (int, float)) else input_size[1] if len(input_size) > 1 else input_size[0]), (input_size if isinstance(input_size, (int, float)) else input_size[0])), 
+                    dtype=dtype
+                )
+                
+                # Procesar cada frame del batch
+                for i, frame_data in enumerate(batch_data):
+                    frame = frame_data['frame']
+                    
+                    # Redimensionar frame
+                    if frame.shape[:2] != input_size:
+                        frame_resized = cv2.resize(frame, input_size, interpolation=cv2.INTER_LINEAR)
+                    else:
+                        frame_resized = frame
+                    
+                    # Convertir BGR a RGB si es necesario
+                    if len(frame_resized.shape) == 3 and frame_resized.shape[2] == 3:
+                        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                    else:
+                        frame_rgb = frame_resized
+                    
+                    # Convertir a tensor y normalizar
+                    frame_tensor = torch.from_numpy(frame_rgb).to(self.device, dtype=dtype)
+                    frame_tensor = frame_tensor.permute(2, 0, 1)  # HWC -> CHW
+                    frame_tensor = frame_tensor / 255.0  # Normalizar a [0, 1]
+                    
+                    # Agregar al batch
+                    batch_tensor[i] = frame_tensor
+                
+                # Sincronizar stream
+                self.preprocessing_stream.synchronize()
+                
+                return batch_tensor
+                
+        except Exception as e:
+            logger.error(f"Error en preprocessing: {e}")
+            return None
+    
+    def _run_inference_batch(self, batch_tensor):
+        """Ejecuta inferencia en el batch"""
+        try:
+            with torch.cuda.stream(self.inference_stream):
+                with torch.no_grad():
+                    # Ejecutar inferencia YOLO
+                    results = self.model(batch_tensor)
+                    
+                    # Sincronizar stream
+                    self.inference_stream.synchronize()
+                    
+                    return results
+                    
+        except Exception as e:
+            logger.error(f"Error en inferencia: {e}")
+            return None
+    
+    def _postprocess_batch(self, inference_results, batch_data):
+        """Postprocesa los resultados de inferencia"""
+        try:
+            with torch.cuda.stream(self.postprocessing_stream):
+                final_results = []
+                
+                for i, (result, frame_data) in enumerate(zip(inference_results, batch_data)):
+                    # Extraer detecciones
+                    detections = self._extract_detections(result, frame_data)
+                    
+                    # Crear resultado final
+                    final_result = {
+                        'detections': detections,
+                        'metadata': {
+                            **frame_data['metadata'],
+                            'frame_id': frame_data['frame_id'],
+                            'timestamp': frame_data['timestamp'],
+                            'original_shape': frame_data['frame'].shape[:2]
+                        }
+                    }
+                    
+                    final_results.append(final_result)
+                
+                # Retornar tensor al pool
+                if hasattr(inference_results, 'prediction') and torch.is_tensor(inference_results.prediction):
+                    self.memory_pool.return_tensor(inference_results.prediction)
+                
+                # Sincronizar stream
+                self.postprocessing_stream.synchronize()
+                
+                return final_results
+                
+        except Exception as e:
+            logger.error(f"Error en postprocessing: {e}")
+            return []
+    
+    def _extract_detections(self, result, frame_data):
+        """Extrae detecciones del resultado YOLO"""
+        try:
+            detections = []
+            
+            if not hasattr(result, 'boxes') or result.boxes is None:
+                return detections
+            
+            boxes = result.boxes
+            if len(boxes) == 0:
+                return detections
+            
+            # Obtener dimensiones originales
+            original_shape = frame_data['frame'].shape[:2]
+            input_size = self.model_config.get('input_size', 640)
+            
+            # Calcular escalas
+            scale_x = original_shape[1] / (input_size if isinstance(input_size, (int, float)) else input_size[0])
+            scale_y = original_shape[0] / (input_size if isinstance(input_size, (int, float)) else input_size[1] if len(input_size) > 1 else input_size[0])
+            
+            # Procesar cada detección
+            for box in boxes:
+                # Coordenadas
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                
+                # Escalar a coordenadas originales
+                x1 = int(x1 * scale_x)
+                y1 = int(y1 * scale_y)
+                x2 = int(x2 * scale_x)
+                y2 = int(y2 * scale_y)
+                
+                # Validar coordenadas
+                x1 = max(0, min(x1, original_shape[1] - 1))
+                y1 = max(0, min(y1, original_shape[0] - 1))
+                x2 = max(0, min(x2, original_shape[1] - 1))
+                y2 = max(0, min(y2, original_shape[0] - 1))
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Clase y confianza
+                cls = int(box.cls[0].cpu().numpy())
+                conf = float(box.conf[0].cpu().numpy())
+                
+                # Filtrar por confianza
+                if conf < self.model_config['confidence_threshold']:
+                    continue
+                
+                # Filtrar por clases si se especifica
+                if (self.model_config.get('classes', None) is not None and 
+                    cls not in self.model_config.get('classes', None)):
+                    continue
+                
+                detections.append({
+                    'bbox': [x1, y1, x2, y2],
+                    'cls': cls,
+                    'conf': conf
+                })
+            
+            return detections
+            
+        except Exception as e:
+            logger.error(f"Error extrayendo detecciones: {e}")
+            return []
+    
+    def _update_performance_stats(self):
+        """Actualiza estadísticas de rendimiento"""
+        try:
+            current_time = time.time()
+            time_diff = current_time - self.last_stats_time
+            
+            if time_diff >= 2.0:  # Actualizar cada 2 segundos
+                # Calcular FPS
+                frames_processed = self.stats['frames_processed']
+                self.stats['fps'] = frames_processed / time_diff if time_diff > 0 else 0
+                
+                # Obtener uso de memoria GPU
+                if torch.cuda.is_available():
+                    memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                    memory_reserved = torch.cuda.memory_reserved() / 1024**3
+                    self.stats['memory_usage'] = memory_allocated
+                    self.stats['memory_reserved'] = memory_reserved
+                
+                # Estadísticas del memory pool
+                pool_stats = self.memory_pool.get_stats()
+                self.stats['memory_pool'] = pool_stats
+                
+                # Actualizar tamaños de cola
+                with self.queue_lock:
+                    self.stats['queue_sizes'] = {
+                        'input': len(self.input_queue),
+                        'processing': len(self.processing_queue),
+                        'output': len(self.output_queue)
+                    }
+                
+                # Calcular eficiencia de batch
+                batch_size = self.model_config['batch_size']
+                avg_queue_size = self.stats['queue_sizes']['input']
+                self.stats['batch_efficiency'] = min(100, (avg_queue_size / batch_size) * 100)
+                
+                # Emitir estadísticas
+                self.performance_stats.emit(self.stats.copy())
+                
+                # Reset contadores
+                self.stats['frames_processed'] = 0
+                self.last_stats_time = current_time
+                
+        except Exception as e:
+            logger.error(f"Error actualizando estadísticas: {e}")
+    
+    def get_stats(self):
+        """Obtiene estadísticas actuales"""
+        return self.stats.copy()
+    
+    def update_model_config(self, new_config):
+        """Actualiza configuración del modelo"""
+        try:
+            # Validar configuración
+            if 'batch_size' in new_config:
+                new_config['batch_size'] = max(1, min(8, new_config['batch_size']))
+            
+            if 'confidence_threshold' in new_config:
+                new_config['confidence_threshold'] = max(0.0, min(1.0, new_config['confidence_threshold']))
+            
+            # Actualizar configuración
+            self.model_config.update(new_config)
+            
+            logger.info(f"Configuración del modelo actualizada: {new_config}")
+            
+        except Exception as e:
+            logger.error(f"Error actualizando configuración: {e}")
+    
+    def get_model_info(self):
+        """Obtiene información del modelo actual"""
+        return {
+            'model_loaded': self.model_loaded,
+            'device': str(self.device),
+            'config': self.model_config.copy(),
+            'gpu_memory_allocated': torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0,
+            'gpu_memory_reserved': torch.cuda.memory_reserved() / 1024**3 if torch.cuda.is_available() else 0,
+        }
+
+
+class AdaptiveBatchProcessor:
+    """
+    Procesador de batch adaptativo que ajusta automáticamente el tamaño 
+    de batch basado en el rendimiento y uso de memoria.
+    """
+    
+    def __init__(self, cuda_processor: CUDAPipelineProcessor):
+        self.cuda_processor = cuda_processor
+        self.performance_history = deque(maxlen=10)
+        self.memory_history = deque(maxlen=10)
+        
+        # Configuración adaptativa
+        self.min_batch_size = 1
+        self.max_batch_size = 8
+        self.target_memory_usage = 3.0  # GB para RTX 3050
+        self.target_fps = 10.0
+        
+        # Estado
+        self.current_batch_size = 4
+        self.adjustment_cooldown = 0
+        self.last_adjustment_time = time.time()
+        
+    def update_performance_metrics(self, stats):
+        """Actualiza métricas y ajusta batch size si es necesario"""
+        try:
+            current_fps = stats.get('fps', 0)
+            memory_usage = stats.get('memory_usage', 0)
+            
+            self.performance_history.append(current_fps)
+            self.memory_history.append(memory_usage)
+            
+            # Verificar si es momento de ajustar
+            current_time = time.time()
+            if current_time - self.last_adjustment_time < 10.0:  # Cooldown de 10s
+                return
+            
+            if len(self.performance_history) < 5:  # Necesita historial
+                return
+            
+            # Calcular promedios
+            avg_fps = sum(self.performance_history) / len(self.performance_history)
+            avg_memory = sum(self.memory_history) / len(self.memory_history)
+            
+            # Decidir ajuste
+            new_batch_size = self._calculate_optimal_batch_size(avg_fps, avg_memory)
+            
+            if new_batch_size != self.current_batch_size:
+                self._apply_batch_size_change(new_batch_size)
+                self.last_adjustment_time = current_time
+                
+        except Exception as e:
+            logger.error(f"Error en adaptive batch processor: {e}")
+    
+    def _calculate_optimal_batch_size(self, avg_fps, avg_memory):
+        """Calcula el tamaño de batch óptimo"""
+        current_size = self.current_batch_size
+        
+        # Si la memoria está muy alta, reducir batch
+        if avg_memory > self.target_memory_usage * 1.1:
+            return max(self.min_batch_size, current_size - 1)
+        
+        # Si el FPS está bajo y hay memoria disponible, mantener o reducir
+        if avg_fps < self.target_fps * 0.8 and avg_memory > self.target_memory_usage * 0.8:
+            return max(self.min_batch_size, current_size - 1)
+        
+        # Si hay margen de memoria y FPS es bueno, intentar aumentar
+        if (avg_memory < self.target_memory_usage * 0.7 and 
+            avg_fps >= self.target_fps and 
+            current_size < self.max_batch_size):
+            return min(self.max_batch_size, current_size + 1)
+        
+        # Mantener tamaño actual
+        return current_size
+    
+    def _apply_batch_size_change(self, new_batch_size):
+        """Aplica cambio de tamaño de batch"""
+        try:
+            old_size = self.current_batch_size
+            self.current_batch_size = new_batch_size
+            
+            # Actualizar configuración del procesador
+            self.cuda_processor.update_model_config({'batch_size': new_batch_size})
+            
+            logger.info(f"Batch size ajustado: {old_size} -> {new_batch_size}")
+            
+        except Exception as e:
+            logger.error(f"Error aplicando cambio de batch size: {e}")
+
+
+class CUDAPipelineManager:
+    """Manager para múltiples pipelines CUDA"""
+    
+    def __init__(self, device='cuda:0'):
+        self.device = device
+        self.processors = {}
+        self.adaptive_processors = {}
+        
+    def create_processor(self, processor_id, model_config=None):
+        """Crea un nuevo procesador CUDA"""
+        try:
+            if processor_id in self.processors:
+                logger.warning(f"Procesador {processor_id} ya existe. Reemplazando...")
+                self.remove_processor(processor_id)
+            
+            # Crear procesador
+            processor = CUDAPipelineProcessor(model_config, self.device)
+            
+            # Crear adaptive processor
+            adaptive = AdaptiveBatchProcessor(processor)
+            
+            # Conectar señales
+            processor.performance_stats.connect(adaptive.update_performance_metrics)
+            
+            self.processors[processor_id] = processor
+            self.adaptive_processors[processor_id] = adaptive
+            
+            logger.info(f"Procesador CUDA {processor_id} creado")
+            return processor
+            
+        except Exception as e:
+            logger.error(f"Error creando procesador {processor_id}: {e}")
+            return None
+    
+    def get_processor(self, processor_id):
+        """Obtiene un procesador por ID"""
+        return self.processors.get(processor_id)
+    
+    def remove_processor(self, processor_id):
+        """Remueve un procesador"""
+        try:
+            if processor_id in self.processors:
+                processor = self.processors[processor_id]
+                processor.stop_processing()
+                
+                del self.processors[processor_id]
+                if processor_id in self.adaptive_processors:
+                    del self.adaptive_processors[processor_id]
+                
+                logger.info(f"Procesador {processor_id} removido")
+                
+        except Exception as e:
+            logger.error(f"Error removiendo procesador {processor_id}: {e}")
+    
+    def stop_all_processors(self):
+        """Detiene todos los procesadores"""
+        logger.info("Deteniendo todos los procesadores CUDA...")
+        
+        for processor_id in list(self.processors.keys()):
+            self.remove_processor(processor_id)
+        
+        # Limpieza global
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        logger.info("Todos los procesadores CUDA detenidos")
+    
+    def get_global_stats(self):
+        """Obtiene estadísticas globales de todos los procesadores"""
+        total_stats = {
+            'total_processors': len(self.processors),
+            'total_fps': 0.0,
+            'total_memory_usage': 0.0,
+            'individual_stats': {}
+        }
+        
+        for processor_id, processor in self.processors.items():
+            stats = processor.get_stats()
+            total_stats['total_fps'] += stats.get('fps', 0)
+            total_stats['total_memory_usage'] += stats.get('memory_usage', 0)
+            total_stats['individual_stats'][processor_id] = stats
+        
+        return total_stats
+
+
+# Instancia global del manager
+cuda_pipeline_manager = CUDAPipelineManager()
+
+
+def verify_cuda_pipeline_requirements():
+    """Verifica los requisitos para el pipeline CUDA"""
+    try:
+        requirements = {
+            'cuda_available': torch.cuda.is_available(),
+            'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            'pytorch_version': torch.__version__,
+            'cuda_version': torch.version.cuda if torch.cuda.is_available() else None,
+            'gpu_info': None,
+            'memory_available': 0,
+            'compute_capability': None
+        }
+        
+        if requirements['cuda_available']:
+            gpu_props = torch.cuda.get_device_properties(0)
+            requirements['gpu_info'] = gpu_props.name
+            requirements['memory_available'] = gpu_props.total_memory / 1024**3  # GB
+            requirements['compute_capability'] = f"{gpu_props.major}.{gpu_props.minor}"
+        
+        # Verificar versiones mínimas
+        issues = []
+        
+        if not requirements['cuda_available']:
+            issues.append("CUDA no está disponible")
+        
+        if requirements['memory_available'] < 2.0:
+            issues.append(f"Memoria GPU insuficiente: {requirements['memory_available']:.1f}GB (mínimo 2GB)")
+        
+        if requirements['compute_capability'] and float(requirements['compute_capability']) < 6.1:
+            issues.append(f"Compute capability muy baja: {requirements['compute_capability']} (mínimo 6.1)")
+        
+        return requirements, issues
+        
+    except Exception as e:
+        logger.error(f"Error verificando requisitos CUDA: {e}")
+        return {}, [str(e)]
+
+
+# Ejemplo de uso para testing
+if __name__ == "__main__":
+    import sys
+    
+    # Verificar requisitos
+    requirements, issues = verify_cuda_pipeline_requirements()
+    
+    print("=== VERIFICACIÓN PIPELINE CUDA ===")
+    print(f"CUDA disponible: {requirements.get('cuda_available', False)}")
+    print(f"GPU: {requirements.get('gpu_info', 'N/A')}")
+    print(f"Memoria: {requirements.get('memory_available', 0):.1f} GB")
+    print(f"Compute capability: {requirements.get('compute_capability', 'N/A')}")
+    
+    if issues:
+        print("\n⚠️ PROBLEMAS DETECTADOS:")
+        for issue in issues:
+            print(f"  - {issue}")
+        sys.exit(1)
+    
+    print("\n✅ Todos los requisitos están disponibles")
+    
+    # Test básico del procesador
+    try:
+        # Configuración de test
+        model_config = {
+            'model_path': 'yolov8n.pt',  # Modelo ligero para test
+            'input_size': (640, 640),
+            'confidence_threshold': 0.5,
+            'batch_size': 2,  # Batch pequeño para test
+            'half_precision': True,
+        }
+        
+        # Crear procesador
+        processor = cuda_pipeline_manager.create_processor(
+            'test_processor', 
+            model_config
+        )
+        
+        if processor:
+            print("\n🧪 INICIANDO TEST DEL PIPELINE...")
+            
+            # Cargar modelo
+            processor.load_model()
+            
+            # Iniciar procesamiento
+            processor.start_processing()
+            
+            # Simular algunos frames
+            test_frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+            
+            for i in range(5):
+                success = processor.add_frame(test_frame, {'test_frame': i})
+                print(f"Frame {i+1} agregado: {success}")
+                time.sleep(0.1)
+            
+            # Esperar procesamiento
+            time.sleep(2.0)
+            
+            # Obtener estadísticas
+            stats = processor.get_stats()
+            print(f"\n📊 ESTADÍSTICAS:")
+            print(f"  FPS: {stats.get('fps', 0):.1f}")
+            print(f"  Memoria GPU: {stats.get('memory_usage', 0):.1f} GB")
+            print(f"  Tiempo inferencia: {stats.get('inference_time', 0):.1f} ms")
+            print(f"  Frames procesados: {stats.get('frames_processed', 0)}")
+            
+            # Detener
+            processor.stop_processing()
+            cuda_pipeline_manager.stop_all_processors()
+            
+            print("\n✅ Test completado exitosamente")
+        
+        else:
+            print("\n❌ No se pudo crear el procesador")
+            
+    except Exception as e:
+        print(f"\n❌ Error en test: {e}")
+        cuda_pipeline_manager.stop_all_processors()
