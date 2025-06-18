@@ -1,0 +1,705 @@
+"""
+Utilidades para manejo de grilla de seguimiento PTZ
+Funciones auxiliares para cálculos de posición y mapeo de coordenadas
+"""
+
+import math
+import json
+from typing import List, Tuple, Dict, Optional, Set
+from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class GridCell:
+    """Representa una celda de la grilla"""
+    row: int
+    col: int
+    x_start: int
+    y_start: int
+    width: int
+    height: int
+    center_x: int
+    center_y: int
+    is_active: bool = False
+    detection_count: int = 0
+
+@dataclass
+class GridZone:
+    """Representa una zona de la grilla"""
+    id: int
+    name: str
+    cells: List[Tuple[int, int]]
+    priority: int = 1
+    enabled: bool = True
+    tracking_sensitivity: float = 0.005
+
+class GridUtils:
+    """Utilidades para manejo de grilla de seguimiento"""
+    
+    def __init__(self, grid_rows: int = 12, grid_cols: int = 16):
+        self.grid_rows = grid_rows
+        self.grid_cols = grid_cols
+        self.grid_cells: Dict[Tuple[int, int], GridCell] = {}
+        self.zones: Dict[int, GridZone] = {}
+        
+    def initialize_grid(self, frame_width: int, frame_height: int):
+        """
+        Inicializar la grilla con las dimensiones del frame
+        
+        Args:
+            frame_width: Ancho del frame en píxeles
+            frame_height: Alto del frame en píxeles
+        """
+        try:
+            cell_width = frame_width // self.grid_cols
+            cell_height = frame_height // self.grid_rows
+            
+            self.grid_cells.clear()
+            
+            for row in range(self.grid_rows):
+                for col in range(self.grid_cols):
+                    x_start = col * cell_width
+                    y_start = row * cell_height
+                    
+                    # Ajustar última columna/fila para cubrir píxeles restantes
+                    width = cell_width
+                    height = cell_height
+                    
+                    if col == self.grid_cols - 1:
+                        width = frame_width - x_start
+                    if row == self.grid_rows - 1:
+                        height = frame_height - y_start
+                    
+                    center_x = x_start + width // 2
+                    center_y = y_start + height // 2
+                    
+                    cell = GridCell(
+                        row=row,
+                        col=col,
+                        x_start=x_start,
+                        y_start=y_start,
+                        width=width,
+                        height=height,
+                        center_x=center_x,
+                        center_y=center_y
+                    )
+                    
+                    self.grid_cells[(row, col)] = cell
+            
+            logger.info(f"Grilla inicializada: {self.grid_rows}x{self.grid_cols} "
+                       f"para frame {frame_width}x{frame_height}")
+                       
+        except Exception as e:
+            logger.error(f"Error inicializando grilla: {e}")
+    
+    def pixel_to_grid_cell(self, x: int, y: int, frame_width: int, frame_height: int) -> Tuple[int, int]:
+        """
+        Convertir coordenadas de píxel a celda de grilla
+        
+        Args:
+            x: Coordenada X en píxeles
+            y: Coordenada Y en píxeles
+            frame_width: Ancho del frame
+            frame_height: Alto del frame
+            
+        Returns:
+            Tuple[int, int]: (fila, columna) de la celda
+        """
+        try:
+            # Asegurar que las coordenadas estén dentro del frame
+            x = max(0, min(x, frame_width - 1))
+            y = max(0, min(y, frame_height - 1))
+            
+            # Calcular celda
+            col = min(int(x * self.grid_cols / frame_width), self.grid_cols - 1)
+            row = min(int(y * self.grid_rows / frame_height), self.grid_rows - 1)
+            
+            return (row, col)
+            
+        except Exception as e:
+            logger.error(f"Error convirtiendo píxel a celda: {e}")
+            return (0, 0)
+    
+    def grid_cell_to_pixel(self, row: int, col: int, frame_width: int, frame_height: int) -> Tuple[int, int]:
+        """
+        Convertir celda de grilla a coordenadas centrales de píxel
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            frame_width: Ancho del frame
+            frame_height: Alto del frame
+            
+        Returns:
+            Tuple[int, int]: (x, y) coordenadas centrales en píxeles
+        """
+        try:
+            # Validar coordenadas de celda
+            row = max(0, min(row, self.grid_rows - 1))
+            col = max(0, min(col, self.grid_cols - 1))
+            
+            # Calcular posición central de la celda
+            cell_width = frame_width / self.grid_cols
+            cell_height = frame_height / self.grid_rows
+            
+            center_x = int((col + 0.5) * cell_width)
+            center_y = int((row + 0.5) * cell_height)
+            
+            return (center_x, center_y)
+            
+        except Exception as e:
+            logger.error(f"Error convirtiendo celda a píxel: {e}")
+            return (frame_width // 2, frame_height // 2)
+    
+    def get_bbox_grid_cells(self, bbox: Tuple[int, int, int, int], 
+                           frame_width: int, frame_height: int) -> List[Tuple[int, int]]:
+        """
+        Obtener todas las celdas que intersectan con un bounding box
+        
+        Args:
+            bbox: (x, y, width, height) del bounding box
+            frame_width: Ancho del frame
+            frame_height: Alto del frame
+            
+        Returns:
+            List[Tuple[int, int]]: Lista de celdas (fila, columna)
+        """
+        try:
+            x, y, w, h = bbox
+            
+            # Calcular esquinas del bbox
+            x1, y1 = x, y
+            x2, y2 = x + w, y + h
+            
+            # Convertir esquinas a celdas
+            start_row, start_col = self.pixel_to_grid_cell(x1, y1, frame_width, frame_height)
+            end_row, end_col = self.pixel_to_grid_cell(x2, y2, frame_width, frame_height)
+            
+            # Recopilar todas las celdas en el rango
+            cells = []
+            for row in range(start_row, end_row + 1):
+                for col in range(start_col, end_col + 1):
+                    if 0 <= row < self.grid_rows and 0 <= col < self.grid_cols:
+                        cells.append((row, col))
+            
+            return cells
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo celdas del bbox: {e}")
+            return []
+    
+    def get_cell_center(self, row: int, col: int, frame_width: int, frame_height: int) -> Tuple[int, int]:
+        """Obtener el centro de una celda específica"""
+        return self.grid_cell_to_pixel(row, col, frame_width, frame_height)
+    
+    def get_cell_info(self, row: int, col: int) -> Optional[GridCell]:
+        """
+        Obtener información de una celda específica
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            
+        Returns:
+            GridCell: Información de la celda o None si no existe
+        """
+        return self.grid_cells.get((row, col))
+    
+    def activate_cells(self, cells: List[Tuple[int, int]]):
+        """
+        Activar celdas específicas para seguimiento
+        
+        Args:
+            cells: Lista de celdas (fila, columna) a activar
+        """
+        try:
+            for row, col in cells:
+                if (row, col) in self.grid_cells:
+                    self.grid_cells[(row, col)].is_active = True
+            
+            logger.info(f"Activadas {len(cells)} celdas para seguimiento")
+            
+        except Exception as e:
+            logger.error(f"Error activando celdas: {e}")
+    
+    def deactivate_cells(self, cells: List[Tuple[int, int]]):
+        """
+        Desactivar celdas específicas
+        
+        Args:
+            cells: Lista de celdas (fila, columna) a desactivar
+        """
+        try:
+            for row, col in cells:
+                if (row, col) in self.grid_cells:
+                    self.grid_cells[(row, col)].is_active = False
+            
+            logger.info(f"Desactivadas {len(cells)} celdas")
+            
+        except Exception as e:
+            logger.error(f"Error desactivando celdas: {e}")
+    
+    def get_active_cells(self) -> List[Tuple[int, int]]:
+        """
+        Obtener lista de celdas activas
+        
+        Returns:
+            List[Tuple[int, int]]: Lista de celdas activas
+        """
+        try:
+            active_cells = []
+            for (row, col), cell in self.grid_cells.items():
+                if cell.is_active:
+                    active_cells.append((row, col))
+            
+            return active_cells
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo celdas activas: {e}")
+            return []
+    
+    def clear_all_activations(self):
+        """Desactivar todas las celdas"""
+        try:
+            for cell in self.grid_cells.values():
+                cell.is_active = False
+            
+            logger.info("Todas las celdas desactivadas")
+            
+        except Exception as e:
+            logger.error(f"Error limpiando activaciones: {e}")
+    
+    def activate_all_cells(self):
+        """Activar todas las celdas"""
+        try:
+            for cell in self.grid_cells.values():
+                cell.is_active = True
+            
+            logger.info("Todas las celdas activadas")
+            
+        except Exception as e:
+            logger.error(f"Error activando todas las celdas: {e}")
+    
+    def is_cell_active(self, row: int, col: int) -> bool:
+        """
+        Verificar si una celda está activa
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            
+        Returns:
+            bool: True si la celda está activa
+        """
+        cell = self.grid_cells.get((row, col))
+        return cell.is_active if cell else False
+    
+    def increment_detection_count(self, row: int, col: int):
+        """
+        Incrementar contador de detecciones para una celda
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+        """
+        try:
+            if (row, col) in self.grid_cells:
+                self.grid_cells[(row, col)].detection_count += 1
+                
+        except Exception as e:
+            logger.error(f"Error incrementando contador de detecciones: {e}")
+    
+    def get_detection_count(self, row: int, col: int) -> int:
+        """
+        Obtener contador de detecciones para una celda
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            
+        Returns:
+            int: Número de detecciones
+        """
+        cell = self.grid_cells.get((row, col))
+        return cell.detection_count if cell else 0
+    
+    def reset_detection_counts(self):
+        """Resetear todos los contadores de detecciones"""
+        try:
+            for cell in self.grid_cells.values():
+                cell.detection_count = 0
+            
+            logger.info("Contadores de detecciones reseteados")
+            
+        except Exception as e:
+            logger.error(f"Error reseteando contadores: {e}")
+    
+    def get_detection_heatmap(self) -> Dict[Tuple[int, int], int]:
+        """
+        Obtener mapa de calor de detecciones
+        
+        Returns:
+            Dict: Mapa con (fila, col) -> count
+        """
+        try:
+            heatmap = {}
+            for (row, col), cell in self.grid_cells.items():
+                if cell.detection_count > 0:
+                    heatmap[(row, col)] = cell.detection_count
+            
+            return heatmap
+            
+        except Exception as e:
+            logger.error(f"Error creando mapa de calor: {e}")
+            return {}
+    
+    # =============================================================================
+    # MANEJO DE ZONAS
+    # =============================================================================
+    
+    def create_zone(self, zone_id: int, name: str, cells: List[Tuple[int, int]], 
+                   priority: int = 1, enabled: bool = True, 
+                   tracking_sensitivity: float = 0.005) -> bool:
+        """
+        Crear nueva zona de seguimiento
+        
+        Args:
+            zone_id: ID único de la zona
+            name: Nombre de la zona
+            cells: Lista de celdas que componen la zona
+            priority: Prioridad de la zona (1 = más alta)
+            enabled: Si la zona está habilitada
+            tracking_sensitivity: Sensibilidad específica para esta zona
+            
+        Returns:
+            bool: True si se creó exitosamente
+        """
+        try:
+            zone = GridZone(
+                id=zone_id,
+                name=name,
+                cells=cells,
+                priority=priority,
+                enabled=enabled,
+                tracking_sensitivity=tracking_sensitivity
+            )
+            
+            self.zones[zone_id] = zone
+            
+            # Activar celdas de la zona si está habilitada
+            if enabled:
+                self.activate_cells(cells)
+            
+            logger.info(f"Zona '{name}' creada con {len(cells)} celdas")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creando zona: {e}")
+            return False
+    
+    def delete_zone(self, zone_id: int) -> bool:
+        """
+        Eliminar zona de seguimiento
+        
+        Args:
+            zone_id: ID de la zona a eliminar
+            
+        Returns:
+            bool: True si se eliminó exitosamente
+        """
+        try:
+            if zone_id in self.zones:
+                zone = self.zones[zone_id]
+                
+                # Desactivar celdas de la zona
+                self.deactivate_cells(zone.cells)
+                
+                # Eliminar zona
+                del self.zones[zone_id]
+                
+                logger.info(f"Zona {zone_id} eliminada")
+                return True
+            else:
+                logger.warning(f"Zona {zone_id} no encontrada")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error eliminando zona: {e}")
+            return False
+    
+    def enable_zone(self, zone_id: int) -> bool:
+        """
+        Habilitar zona de seguimiento
+        
+        Args:
+            zone_id: ID de la zona
+            
+        Returns:
+            bool: True si se habilitó exitosamente
+        """
+        try:
+            if zone_id in self.zones:
+                zone = self.zones[zone_id]
+                zone.enabled = True
+                self.activate_cells(zone.cells)
+                
+                logger.info(f"Zona {zone_id} habilitada")
+                return True
+            else:
+                logger.warning(f"Zona {zone_id} no encontrada")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error habilitando zona: {e}")
+            return False
+    
+    def disable_zone(self, zone_id: int) -> bool:
+        """
+        Deshabilitar zona de seguimiento
+        
+        Args:
+            zone_id: ID de la zona
+            
+        Returns:
+            bool: True si se deshabilitó exitosamente
+        """
+        try:
+            if zone_id in self.zones:
+                zone = self.zones[zone_id]
+                zone.enabled = False
+                self.deactivate_cells(zone.cells)
+                
+                logger.info(f"Zona {zone_id} deshabilitada")
+                return True
+            else:
+                logger.warning(f"Zona {zone_id} no encontrada")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error deshabilitando zona: {e}")
+            return False
+    
+    def get_zone_for_cell(self, row: int, col: int) -> Optional[GridZone]:
+        """
+        Obtener la zona de mayor prioridad que contiene una celda
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            
+        Returns:
+            GridZone: Zona que contiene la celda o None
+        """
+        try:
+            matching_zones = []
+            
+            for zone in self.zones.values():
+                if zone.enabled and (row, col) in zone.cells:
+                    matching_zones.append(zone)
+            
+            if matching_zones:
+                # Retornar zona con mayor prioridad (menor número)
+                return min(matching_zones, key=lambda z: z.priority)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo zona para celda: {e}")
+            return None
+    
+    def get_tracking_sensitivity_for_cell(self, row: int, col: int, 
+                                        default_sensitivity: float = 0.005) -> float:
+        """
+        Obtener sensibilidad de seguimiento para una celda específica
+        
+        Args:
+            row: Fila de la celda
+            col: Columna de la celda
+            default_sensitivity: Sensibilidad por defecto
+            
+        Returns:
+            float: Sensibilidad de seguimiento
+        """
+        try:
+            zone = self.get_zone_for_cell(row, col)
+            return zone.tracking_sensitivity if zone else default_sensitivity
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo sensibilidad: {e}")
+            return default_sensitivity
+    
+    # =============================================================================
+    # UTILIDADES DE DISTANCIA Y GEOMETRÍA
+    # =============================================================================
+    
+    def calculate_cell_distance(self, cell1: Tuple[int, int], cell2: Tuple[int, int]) -> float:
+        """
+        Calcular distancia euclidiana entre dos celdas
+        
+        Args:
+            cell1: Primera celda (fila, columna)
+            cell2: Segunda celda (fila, columna)
+            
+        Returns:
+            float: Distancia entre celdas
+        """
+        try:
+            row1, col1 = cell1
+            row2, col2 = cell2
+            
+            return math.sqrt((row2 - row1) ** 2 + (col2 - col1) ** 2)
+            
+        except Exception as e:
+            logger.error(f"Error calculando distancia: {e}")
+            return float('inf')
+    
+    def get_neighboring_cells(self, row: int, col: int, radius: int = 1) -> List[Tuple[int, int]]:
+        """
+        Obtener celdas vecinas dentro de un radio
+        
+        Args:
+            row: Fila de la celda central
+            col: Columna de la celda central
+            radius: Radio de vecindad
+            
+        Returns:
+            List[Tuple[int, int]]: Lista de celdas vecinas
+        """
+        try:
+            neighbors = []
+            
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    if dr == 0 and dc == 0:
+                        continue  # Saltar celda central
+                    
+                    new_row = row + dr
+                    new_col = col + dc
+                    
+                    # Verificar límites
+                    if (0 <= new_row < self.grid_rows and 
+                        0 <= new_col < self.grid_cols):
+                        neighbors.append((new_row, new_col))
+            
+            return neighbors
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo vecinos: {e}")
+            return []
+    
+    def get_cells_in_rectangle(self, top_left: Tuple[int, int], 
+                              bottom_right: Tuple[int, int]) -> List[Tuple[int, int]]:
+        """
+        Obtener todas las celdas dentro de un rectángulo
+        
+        Args:
+            top_left: Celda superior izquierda (fila, columna)
+            bottom_right: Celda inferior derecha (fila, columna)
+            
+        Returns:
+            List[Tuple[int, int]]: Lista de celdas en el rectángulo
+        """
+        try:
+            cells = []
+            
+            start_row, start_col = top_left
+            end_row, end_col = bottom_right
+            
+            # Asegurar orden correcto
+            min_row = min(start_row, end_row)
+            max_row = max(start_row, end_row)
+            min_col = min(start_col, end_col)
+            max_col = max(start_col, end_col)
+            
+            for row in range(min_row, max_row + 1):
+                for col in range(min_col, max_col + 1):
+                    if (0 <= row < self.grid_rows and 
+                        0 <= col < self.grid_cols):
+                        cells.append((row, col))
+            
+            return cells
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo celdas en rectángulo: {e}")
+            return []
+    
+    # =============================================================================
+    # SERIALIZACIÓN Y PERSISTENCIA
+    # =============================================================================
+    
+    def save_configuration(self, filename: str) -> bool:
+        """
+        Guardar configuración de grilla en archivo
+        
+        Args:
+            filename: Nombre del archivo
+            
+        Returns:
+            bool: True si se guardó exitosamente
+        """
+        try:
+            config = {
+                "grid_dimensions": {
+                    "rows": self.grid_rows,
+                    "cols": self.grid_cols
+                },
+                "active_cells": self.get_active_cells(),
+                "zones": {
+                    zone_id: {
+                        "id": zone.id,
+                        "name": zone.name,
+                        "cells": zone.cells,
+                        "priority": zone.priority,
+                        "enabled": zone.enabled,
+                        "tracking_sensitivity": zone.tracking_sensitivity
+                    }
+                    for zone_id, zone in self.zones.items()
+                },
+                "detection_counts": {
+                    f"{row},{col}": cell.detection_count
+                    for (row, col), cell in self.grid_cells.items()
+                    if cell.detection_count > 0
+                }
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            logger.info(f"Configuración de grilla guardada en {filename}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error guardando configuración: {e}")
+            return False
+    
+    def load_configuration(self, filename: str) -> bool:
+        """
+        Cargar configuración de grilla desde archivo
+        
+        Args:
+            filename: Nombre del archivo
+            
+        Returns:
+            bool: True si se cargó exitosamente
+        """
+        try:
+            with open(filename, 'r') as f:
+                config = json.load(f)
+            
+            # Cargar dimensiones
+            dimensions = config.get("grid_dimensions", {})
+            self.grid_rows = dimensions.get("rows", self.grid_rows)
+            self.grid_cols = dimensions.get("cols", self.grid_cols)
+            
+            # Cargar celdas activas
+            active_cells = config.get("active_cells", [])
+            self.clear_all_activations()
+            self.activate_cells([tuple(cell) for cell in active_cells])
+            
+            # Cargar zonas
+            zones_data = config.get("zones", {})
+            self.zones.clear()
+            
+            for zone_id_str, zone_data in zones_
